@@ -50,6 +50,7 @@ class ModelConfig(BaseModel):
     kv_cache_type: str = "f16"
     max_tokens: Optional[int] = None        # default completion cap
     chat_format: Optional[str] = None       # llama.cpp chat_format override (e.g. "chatml")
+    tools: bool = False                     # enable tool calling (chatml-function-calling)
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
 
     @field_validator("kv_cache_type")
@@ -59,11 +60,21 @@ class ModelConfig(BaseModel):
             raise ValueError(f"kv_cache_type must be one of {KV_CACHE_TYPES}, got {v!r}")
         return v
 
+    @property
+    def effective_chat_format(self) -> Optional[str]:
+        """The chat_format used at load (None = the GGUF's own template).
+
+        Tool calling deliberately does NOT force a handler here: the model's native
+        template both renders the tools and makes the model emit calls reliably in
+        'auto' mode, where the generic function-calling handlers fail. aero parses
+        the native tool-call output itself (see engine._parse_tool_calls)."""
+        return self.chat_format
+
     def load_key(self) -> tuple:
         """What actually determines the loaded llama context. Two models with the
         same key share weights and can be swapped without a reload — only the prompt
         and sampling (applied per request) differ."""
-        return (self.path, self.n_ctx, self.kv_cache_type, self.chat_format)
+        return (self.path, self.n_ctx, self.kv_cache_type, self.effective_chat_format)
 
 
 def resolve_weights(base: Optional[str], name: str, gguf_dir: Path) -> Path:
@@ -105,6 +116,7 @@ def load_config_file(
         kv_cache_type=data.get("kv_cache_type", default_kv_cache_type),
         max_tokens=data.get("max_tokens"),
         chat_format=data.get("chat_format"),
+        tools=data.get("tools", False),
         sampling=SamplingConfig(**data.get("sampling", {})),
     )
 

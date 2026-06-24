@@ -134,25 +134,35 @@ The shared foundation. Per-model config replaces today's process-global knobs.
   the content need generous `max_tokens`; carry that as a per-model default and
   surface it cleanly. (Rendering of `<think>` is Phase f.)
 
-## Phase e — Tool calling & agent support
+## Phase e — Tool calling & agent support (done)
 
-Make the models usable in agent harnesses. The acceptance test: point an existing
-agent framework at `http://127.0.0.1:8317/v1` and have it *just work*. Of the
-installed models, **Llama-3.1-8B, Qwen2.5-3B, and Ministral-8B** are the tool-capable
-ones; TinyLlama/SmolLM/Gemma won't, and DeepSeek-R1 is reasoning-only.
+Agent harnesses pointed at `http://127.0.0.1:8317/v1` work unmodified. Opt in per
+model with `tools = true`.
 
-- **Schema extensions (OpenAI-faithful):** add `tools` / `tool_choice` to the request;
-  `tool_calls` on assistant messages; accept `role:"tool"` messages with
-  `tool_call_id`; allow non-string / `null` message content.
-- **Engine:** pass `tools` into llama.cpp's `create_chat_completion` using the
-  per-model chat template / tool format from the Modelfile (Llama-3.1, Qwen, Mistral/
-  Ministral, Hermes, functionary all differ — this is *why* it's gated on Phase d);
-  parse `tool_calls` out of the output and emit `finish_reason:"tool_calls"`.
-- **Sequencing within the phase:** non-streaming tool calls first (clean), then the
-  genuinely hard part — streaming partial `tool_calls` deltas.
-- **Acceptance test:** a real tool loop via the OpenAI Python SDK against localhost,
-  then one framework (e.g. Pydantic AI or the OpenAI Agents SDK). Framework choice TBD
-  when we start.
+- **Schema (OpenAI-faithful):** `tools` / `tool_choice` on the request; `tool_calls`
+  on assistant messages; `role:"tool"` messages with `tool_call_id`; nullable content.
+- **Prompt-level tool calling (the key design choice).** Rather than rely on each
+  GGUF's chat template — most don't render tools at all, so `create_chat_completion`'s
+  `tools=` is silently dropped — aero injects the tool definitions into a system
+  prompt itself (the Hermes `<tools>` convention) and **parses the model's tool-call
+  output** back into OpenAI `tool_calls`. `_parse_tool_calls` handles the three common
+  formats: `<tool_call>{json}</tool_call>` (Qwen/Hermes), a bare object (Llama-3.1),
+  and a bare array (Ministral); bare-JSON is gated on the request's tool names to
+  avoid false positives. `_normalize_messages` renders assistant-`tool_calls` and
+  `tool` results back into `<tool_call>`/`<tool_response>` text the native template
+  can format. This is model-agnostic and far more reliable in `auto` mode than the
+  generic function-calling handlers.
+- **Streaming:** tool-using turns buffer then emit a `tool_calls` delta +
+  `finish_reason:"tool_calls"`; plain chat still token-streams.
+- **Reliability is a model skill.** Hermes-2-Pro-Mistral-7B calls reliably in `auto`
+  (3/3 with no system prompt); general small models are hit-or-miss. `tool_choice`
+  forces a call regardless. The 8B/3B installed models work but less consistently.
+- **Verified:** the OpenAI Python SDK tool loop *and* the OpenAI Agents SDK complete a
+  full call→execute→answer loop against `hermes-tools` (`examples/`); streaming tool
+  deltas and the non-tool-model 400 guard check out.
+
+Future: other tool-call formats (e.g. Llama-3.1's `<|python_tag|>`), `parallel_tool_calls`,
+and grammar-constrained forcing.
 
 ## Phase f — Web chat UI
 

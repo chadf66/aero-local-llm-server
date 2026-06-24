@@ -44,6 +44,7 @@ _STARTER_TEMPLATE = """\
 # n_ctx = 4096                              # context window: an int, or "auto" to size to memory
 # kv_cache_type = "f16"                     # KV-cache precision: f16 | q8_0 | q4_0  (q8_0/q4_0 fit more context)
 # max_tokens = 2048                         # default completion cap
+# tools = true                              # enable tool/function calling (agents)
 # chat_format = "chatml"                    # override the GGUF's chat template (rarely needed)
 
 # To make a variant that reuses these weights, create another .toml (any name) with:
@@ -212,7 +213,9 @@ def show(
     typer.echo(f"config:  {toml_path if toml_path.is_file() else '(auto-registered GGUF, no definition file)'}")
     typer.echo(f"  n_ctx={cfg.n_ctx}  kv_cache_type={cfg.kv_cache_type}"
                + (f"  max_tokens={cfg.max_tokens}" if cfg.max_tokens else "")
-               + (f"  chat_format={cfg.chat_format}" if cfg.chat_format else ""))
+               + (f"  chat_format={cfg.effective_chat_format}" if cfg.effective_chat_format else ""))
+    if cfg.tools or cfg.effective_chat_format in {"chatml-function-calling", "functionary", "functionary-v1", "functionary-v2"}:
+        typer.echo("  tools: enabled")
     if cfg.system:
         preview = cfg.system if len(cfg.system) <= 60 else cfg.system[:57] + "..."
         typer.echo(f"  system: {preview}")
