@@ -26,32 +26,32 @@ import threading
 import time
 from typing import Any, Iterator, Optional
 
+from .config import KV_CACHE_TYPES, ModelConfig
 from .schemas import ChatCompletionRequest, Usage
 
 logger = logging.getLogger("aero.engine")
 
 # ggml tensor types for the KV cache. These enum values are stable in ggml.
 # f16 is the default (we don't override type_k/type_v); the quantized types need
-# flash attention, which we enable alongside them.
+# flash attention, which we enable alongside them. Keys mirror config.KV_CACHE_TYPES.
 _GGML_TYPE = {"f16": 1, "q8_0": 8, "q4_0": 2}
-KV_CACHE_TYPES = tuple(_GGML_TYPE)
 
 # --------------------------------------------------------------------------- #
 # Configuration + single-slot model state, set by configure() at startup.
 # --------------------------------------------------------------------------- #
 
-_registry: dict[str, str] = {}     # model name -> GGUF path (the servable set)
-_n_ctx = 4096
-_kv_cache_type = "f16"
+_models: dict[str, ModelConfig] = {}   # model name -> its per-model config
 _backend = "llama"
-_idle_timeout = 300.0              # seconds; 0 disables idle-unload
+_idle_timeout = 300.0                  # seconds; 0 disables idle-unload
 
 # The one resident model, guarded by _lock. _handle is a llama_cpp.Llama (or the
 # name string for the stub backend). All loads, unloads, inference, and the idle
 # sweep serialize on _lock -- correct and simple for a single-user box.
 _handle: Any = None
 _loaded_name: Optional[str] = None
+_loaded_key: Optional[tuple] = None    # load_key() of the resident model (weights/ctx/kv)
 _last_used = 0.0
+_load_calls = 0                        # how many times _load actually ran (test seam)
 _lock = threading.RLock()
 
 _idle_thread: Optional[threading.Thread] = None
@@ -59,22 +59,16 @@ _idle_stop = threading.Event()
 
 
 def configure(
-    registry: dict[str, str],
+    models: dict[str, ModelConfig],
     *,
-    n_ctx: int = 4096,
-    kv_cache_type: str = "f16",
     backend: str = "llama",
     idle_timeout: float = 300.0,
 ) -> None:
-    """Install the model registry and load policy. Nothing is loaded yet."""
-    global _registry, _n_ctx, _kv_cache_type, _backend, _idle_timeout
-    if kv_cache_type not in _GGML_TYPE:
-        raise ValueError(f"kv_cache_type must be one of {KV_CACHE_TYPES}, got {kv_cache_type!r}")
+    """Install the per-model configs and load policy. Nothing is loaded yet."""
+    global _models, _backend, _idle_timeout
     with _lock:
         _unload()  # drop any model loaded under the previous config
-        _registry = dict(registry)
-        _n_ctx = n_ctx
-        _kv_cache_type = kv_cache_type
+        _models = dict(models)
         _backend = backend
         _idle_timeout = float(idle_timeout)
     _start_idle_thread()
@@ -82,7 +76,7 @@ def configure(
 
 def available_models() -> list[str]:
     """Every model this server can serve (loaded on demand), sorted by name."""
-    return sorted(_registry)
+    return sorted(_models)
 
 
 def loaded_model() -> Optional[str]:
@@ -96,8 +90,8 @@ def loaded_model() -> Optional[str]:
 
 
 def _load(name: str) -> None:
-    global _handle, _loaded_name
-    path = _registry[name]
+    global _handle, _loaded_name, _loaded_key, _load_calls
+    cfg = _models[name]
 
     if _backend == "stub":
         _handle = name
@@ -106,20 +100,24 @@ def _load(name: str) -> None:
 
         # n_gpu_layers=-1 puts every layer on the Metal GPU -- the whole point on
         # Apple Silicon. Quantized KV cache needs flash attention enabled.
-        kwargs: dict[str, Any] = dict(model_path=path, n_ctx=_n_ctx, n_gpu_layers=-1, verbose=False)
-        if _kv_cache_type != "f16":
-            ggml = _GGML_TYPE[_kv_cache_type]
+        kwargs: dict[str, Any] = dict(model_path=cfg.path, n_ctx=cfg.n_ctx, n_gpu_layers=-1, verbose=False)
+        if cfg.kv_cache_type != "f16":
+            ggml = _GGML_TYPE[cfg.kv_cache_type]
             kwargs.update(type_k=ggml, type_v=ggml, flash_attn=True)
+        if cfg.chat_format:
+            kwargs["chat_format"] = cfg.chat_format
         _handle = Llama(**kwargs)
     else:
         raise ValueError(f"unknown backend {_backend!r}")
 
     _loaded_name = name
-    logger.info("loaded %s (n_ctx=%d, kv=%s)", name, _n_ctx, _kv_cache_type)
+    _loaded_key = cfg.load_key()
+    _load_calls += 1
+    logger.info("loaded %s (n_ctx=%d, kv=%s)", name, cfg.n_ctx, cfg.kv_cache_type)
 
 
 def _unload() -> None:
-    global _handle, _loaded_name
+    global _handle, _loaded_name, _loaded_key
     if _loaded_name is None:
         return
     name = _loaded_name
@@ -131,6 +129,7 @@ def _unload() -> None:
             logger.warning("error freeing %s", name, exc_info=True)
     _handle = None
     _loaded_name = None
+    _loaded_key = None
     logger.info("unloaded %s", name)
 
 
@@ -140,10 +139,14 @@ def _acquire_handle(name: str) -> Any:
     The caller must hold _lock for the duration of the work that uses the handle,
     so the idle sweep can't unload mid-request.
     """
-    global _last_used
-    if name not in _registry:
+    global _last_used, _loaded_name
+    if name not in _models:
         raise KeyError(name)
-    if _loaded_name != name:
+    if _handle is not None and _models[name].load_key() == _loaded_key:
+        # Same weights/context already resident -- a different model that only
+        # differs in system prompt / sampling. Switch persona, no reload.
+        _loaded_name = name
+    elif _loaded_name != name:
         _unload()          # EVICT BEFORE LOAD: free the old model first.
         _load(name)
     _last_used = time.monotonic()
@@ -192,16 +195,32 @@ def _start_idle_thread() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _chat_kwargs(request: ChatCompletionRequest) -> dict:
-    """Map our request fields onto llama-cpp-python's create_chat_completion args."""
+def _effective_kwargs(request: ChatCompletionRequest, cfg: ModelConfig) -> dict:
+    """Build create_chat_completion args, layering per-model config under the request.
+
+    Two kinds of merging:
+      * Default system prompt -- injected only if the request has no system message.
+      * Sampling / max_tokens  -- the request wins for any field it set explicitly
+        (tracked via Pydantic's model_fields_set); otherwise the model's config
+        default applies; otherwise the schema's built-in default.
+    """
+    messages = [m.model_dump() for m in request.messages]
+    if cfg.system and not any(m["role"] == "system" for m in messages):
+        messages = [{"role": "system", "content": cfg.system}] + messages
+
+    def pick(field: str, cfg_val: Any) -> Any:
+        if field in request.model_fields_set:
+            return getattr(request, field)
+        return cfg_val if cfg_val is not None else getattr(request, field)
+
     return {
-        "messages": [m.model_dump() for m in request.messages],
-        "temperature": request.temperature,
-        "max_tokens": request.max_tokens,
-        "top_p": request.top_p,
-        "top_k": request.top_k,
+        "messages": messages,
+        "temperature": pick("temperature", cfg.sampling.temperature),
+        "top_p": pick("top_p", cfg.sampling.top_p),
+        "top_k": pick("top_k", cfg.sampling.top_k),
+        "max_tokens": pick("max_tokens", cfg.max_tokens),
+        "stop": pick("stop", cfg.sampling.stop),
         "seed": request.seed,
-        "stop": request.stop,
     }
 
 
@@ -227,13 +246,14 @@ def run_inference(request: ChatCompletionRequest) -> tuple[str, str, Usage]:
     """
     with _lock:
         handle = _acquire_handle(request.model)
+        cfg = _models[request.model]
 
         if _backend == "stub":
             last = request.messages[-1].content if request.messages else ""
             text = f"[stub:{request.model}] echo: {last}"
             return text, "stop", _usage(_stub_prompt_tokens(request), len(text.split()))
 
-        result = handle.create_chat_completion(**_chat_kwargs(request))
+        result = handle.create_chat_completion(**_effective_kwargs(request, cfg))
         choice, u = result["choices"][0], result["usage"]
         return (
             choice["message"]["content"],
@@ -254,6 +274,7 @@ def stream_inference(
     """
     with _lock:
         handle = _acquire_handle(request.model)
+        cfg = _models[request.model]
         finish_reason = "stop"
         pieces: list[str] = []
 
@@ -263,7 +284,7 @@ def stream_inference(
                 pieces.append(word + " ")
                 yield "content", word + " "
         else:
-            for chunk in handle.create_chat_completion(**_chat_kwargs(request), stream=True):
+            for chunk in handle.create_chat_completion(**_effective_kwargs(request, cfg), stream=True):
                 choice = chunk["choices"][0]
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
