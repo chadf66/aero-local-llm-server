@@ -21,9 +21,12 @@ Two backends:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
 import time
+import uuid
 from typing import Any, Iterator, Optional
 
 from .config import KV_CACHE_TYPES, ModelConfig
@@ -87,6 +90,71 @@ def loaded_model() -> Optional[str]:
     return _loaded_name
 
 
+# llama.cpp chat handlers that parse tool calls themselves (if one is set explicitly).
+_TOOL_CHAT_FORMATS = {"chatml-function-calling", "functionary", "functionary-v1", "functionary-v2"}
+
+# Hermes/Qwen-style tool calls in the native template output: <tool_call>{json}</tool_call>.
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def supports_tools(name: str) -> bool:
+    """Whether model ``name`` is tool-enabled (the `tools` flag, or an explicit
+    function-calling handler)."""
+    cfg = _models.get(name)
+    if cfg is None:
+        return False
+    return cfg.tools or cfg.effective_chat_format in _TOOL_CHAT_FORMATS
+
+
+def _parse_tool_calls(text: Optional[str], tool_names: Optional[set] = None) -> Optional[list[dict]]:
+    """Extract OpenAI-shaped tool calls from a model's native tool-call output.
+
+    Handles the common open-model conventions, which differ by model:
+      * ``<tool_call>{json}</tool_call>`` blocks  (Qwen / Hermes)
+      * a bare JSON object ``{"name":..., "arguments"|"parameters":...}``  (Llama-3.1)
+      * a bare JSON array of such objects  (Ministral)
+
+    For the bare-JSON forms (which look like ordinary content), a call is only
+    accepted when its ``name`` matches one of the request's ``tool_names`` -- so a
+    model that happens to answer with JSON isn't mistaken for a tool call.
+    """
+    if not text:
+        return None
+
+    blocks = _TOOL_CALL_RE.findall(text)
+    raw: list = []
+    if blocks:
+        for b in blocks:
+            try:
+                raw.append(json.loads(b))
+            except json.JSONDecodeError:
+                pass
+    else:
+        try:
+            parsed = json.loads(text.strip())
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            raw = [parsed]
+        elif isinstance(parsed, list):
+            raw = [o for o in parsed if isinstance(o, dict)]
+
+    calls = []
+    for obj in raw:
+        name = obj.get("name")
+        if not name or (tool_names is not None and not blocks and name not in tool_names):
+            continue
+        args = obj.get("arguments", obj.get("parameters", {}))
+        if not isinstance(args, str):
+            args = json.dumps(args)
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name, "arguments": args},
+        })
+    return calls or None
+
+
 # --------------------------------------------------------------------------- #
 # Load / unload (all callers hold _lock).
 # --------------------------------------------------------------------------- #
@@ -112,8 +180,8 @@ def _load(name: str) -> None:
         if cfg.kv_cache_type != "f16":
             ggml = _GGML_TYPE[cfg.kv_cache_type]
             kwargs.update(type_k=ggml, type_v=ggml, flash_attn=True)
-        if cfg.chat_format:
-            kwargs["chat_format"] = cfg.chat_format
+        if cfg.effective_chat_format:
+            kwargs["chat_format"] = cfg.effective_chat_format
         _handle = Llama(**kwargs)
     else:
         raise ValueError(f"unknown backend {_backend!r}")
@@ -203,18 +271,89 @@ def _start_idle_thread() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """Render tool-calling messages into plain system/user/assistant text.
+
+    The native GGUF templates only know system/user/assistant with string content,
+    so an assistant ``tool_calls`` message (no content) or a ``tool`` result would
+    crash them. Since aero does tool calling at the prompt level, we serialize those
+    back into the Hermes ``<tool_call>`` / ``<tool_response>`` text the model expects.
+    """
+    id_to_name = {tc.get("id"): tc.get("function", {}).get("name")
+                  for m in messages for tc in (m.get("tool_calls") or [])}
+    out: list[dict] = []
+    for m in messages:
+        role, content = m.get("role"), m.get("content")
+        if role == "assistant" and m.get("tool_calls"):
+            blocks = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = fn.get("arguments")
+                blocks.append(f'<tool_call>\n{json.dumps({"name": fn.get("name"), "arguments": args})}\n</tool_call>')
+            text = (f"{content}\n" if content else "") + "\n".join(blocks)
+            out.append({"role": "assistant", "content": text})
+        elif role == "tool":
+            name = m.get("name") or id_to_name.get(m.get("tool_call_id"))
+            payload = json.dumps({"name": name, "content": content})
+            out.append({"role": "user", "content": f"<tool_response>\n{payload}\n</tool_response>"})
+        else:
+            out.append({"role": role, "content": content if content is not None else ""})
+    return out
+
+
+def _tool_system_prompt(request: ChatCompletionRequest) -> str:
+    """The function-calling instructions aero injects when a request carries tools.
+
+    We render the tools into a system prompt ourselves (the widely-trained Hermes
+    `<tools>`/`<tool_call>` convention) rather than rely on the GGUF's chat template
+    -- many templates don't render tools at all, so passing ``tools`` to llama.cpp
+    would silently drop them. aero then parses the `<tool_call>` output back into
+    OpenAI tool_calls (see _parse_tool_calls)."""
+    sigs = "\n".join(json.dumps(t.model_dump(exclude_none=True)) for t in request.tools)
+    prompt = (
+        "You are a function calling AI model. You are provided with function "
+        "signatures within <tools></tools> XML tags. You may call one or more "
+        "functions to assist with the user query. Don't make assumptions about what "
+        "values to plug into functions.\n"
+        f"<tools>\n{sigs}\n</tools>\n\n"
+        "To call a function, respond with ONLY a JSON object wrapped in "
+        "<tool_call></tool_call> tags, and nothing else:\n"
+        '<tool_call>\n{"name": "<function-name>", "arguments": <arguments-object>}\n</tool_call>'
+    )
+    # A specific function / "required" -> insist on a call; "auto"/None -> model's choice.
+    if request.tool_choice not in (None, "auto"):
+        prompt += "\nYou MUST call one of the functions; do not answer in prose."
+    return prompt
+
+
 def _effective_kwargs(request: ChatCompletionRequest, cfg: ModelConfig) -> dict:
     """Build create_chat_completion args, layering per-model config under the request.
 
-    Two kinds of merging:
+    Merging:
       * Default system prompt -- injected only if the request has no system message.
-      * Sampling / max_tokens  -- the request wins for any field it set explicitly
+      * Tool instructions      -- when the request carries tools, appended to the
+        system message (model-agnostic; see _tool_system_prompt).
+      * Sampling / max_tokens   -- the request wins for any field it set explicitly
         (tracked via Pydantic's model_fields_set); otherwise the model's config
         default applies; otherwise the schema's built-in default.
     """
-    messages = [m.model_dump() for m in request.messages]
+    # exclude_none so optional tool fields only appear when set, then render any
+    # tool-calling messages into plain text the native template can handle.
+    messages = _normalize_messages([m.model_dump(exclude_none=True) for m in request.messages])
     if cfg.system and not any(m["role"] == "system" for m in messages):
         messages = [{"role": "system", "content": cfg.system}] + messages
+
+    if request.tools:
+        instructions = _tool_system_prompt(request)
+        sys_idx = next((i for i, m in enumerate(messages) if m["role"] == "system"), None)
+        if sys_idx is not None:
+            base = messages[sys_idx].get("content") or ""
+            messages[sys_idx] = {**messages[sys_idx], "content": f"{base}\n\n{instructions}".strip()}
+        else:
+            messages = [{"role": "system", "content": instructions}] + messages
 
     def pick(field: str, cfg_val: Any) -> Any:
         if field in request.model_fields_set:
@@ -242,39 +381,57 @@ def _usage(prompt_tokens: int, completion_tokens: int) -> Usage:
 
 def _stub_prompt_tokens(request: ChatCompletionRequest) -> int:
     """A whitespace-token stand-in for the stub backend (no real tokenizer)."""
-    return sum(len(m.content.split()) for m in request.messages)
+    return sum(len((m.content or "").split()) for m in request.messages)
 
 
-def run_inference(request: ChatCompletionRequest) -> tuple[str, str, Usage]:
+def _stub_tool_call(request: ChatCompletionRequest) -> dict:
+    """A canned tool call (first tool, empty args) so tests exercise the tool path
+    without a real model."""
+    fn = request.tools[0].function.name
+    return {"id": "call_stub0", "type": "function", "function": {"name": fn, "arguments": "{}"}}
+
+
+def run_inference(request: ChatCompletionRequest) -> tuple[dict, str, Usage]:
     """Run a (non-streaming) chat completion, loading the model if needed.
 
-    Returns ``(text, finish_reason, usage)``. finish_reason is "stop" for a
-    natural end or "length" when the output hit ``max_tokens``; usage carries the
-    prompt/completion token counts (exact, straight from llama.cpp's result).
+    Returns ``(message, finish_reason, usage)`` where ``message`` is the assistant
+    message dict (``content`` and/or ``tool_calls``). finish_reason is "stop",
+    "length" (hit max_tokens), or "tool_calls"; usage carries the token counts.
     """
     with _lock:
         handle = _acquire_handle(request.model)
         cfg = _models[request.model]
 
         if _backend == "stub":
+            if request.tools:
+                msg = {"role": "assistant", "content": None, "tool_calls": [_stub_tool_call(request)]}
+                return msg, "tool_calls", _usage(_stub_prompt_tokens(request), 1)
             last = request.messages[-1].content if request.messages else ""
             text = f"[stub:{request.model}] echo: {last}"
-            return text, "stop", _usage(_stub_prompt_tokens(request), len(text.split()))
+            return {"role": "assistant", "content": text}, "stop", _usage(
+                _stub_prompt_tokens(request), len(text.split())
+            )
 
         result = handle.create_chat_completion(**_effective_kwargs(request, cfg))
         choice, u = result["choices"][0], result["usage"]
-        return (
-            choice["message"]["content"],
-            choice.get("finish_reason") or "stop",
-            _usage(u["prompt_tokens"], u["completion_tokens"]),
-        )
+        message = choice["message"]
+        finish_reason = choice.get("finish_reason") or "stop"
+        # Native templates emit tool calls as <tool_call> text; parse them ourselves
+        # unless an explicit function-calling handler already produced tool_calls.
+        if request.tools and not message.get("tool_calls"):
+            parsed = _parse_tool_calls(message.get("content"), {t.function.name for t in request.tools})
+            if parsed:
+                message = {"role": "assistant", "content": None, "tool_calls": parsed}
+                finish_reason = "tool_calls"
+        return message, finish_reason, _usage(u["prompt_tokens"], u["completion_tokens"])
 
 
 def stream_inference(
     request: ChatCompletionRequest,
 ) -> Iterator[tuple[str, Any]]:
-    """Yield streaming events: ``("content", piece)`` chunks, then a single
-    ``("end", (finish_reason, usage))``.
+    """Yield streaming events: ``("delta", delta_dict)`` chunks (each an OpenAI
+    delta with ``content`` and/or ``tool_calls``), then ``("end", (finish_reason,
+    usage))``.
 
     The lock is held for the whole generation -- through the final usage tally --
     so the idle sweep can't unload the model out from under a stream. (Single-user
@@ -287,19 +444,49 @@ def stream_inference(
         pieces: list[str] = []
 
         if _backend == "stub":
-            last = request.messages[-1].content if request.messages else ""
-            for word in f"[stub:{request.model}] echo: {last}".split(" "):
-                pieces.append(word + " ")
-                yield "content", word + " "
-        else:
-            for chunk in handle.create_chat_completion(**_effective_kwargs(request, cfg), stream=True):
+            if request.tools:
+                yield "delta", {"role": "assistant", "tool_calls": [{"index": 0, **_stub_tool_call(request)}]}
+                finish_reason = "tool_calls"
+            else:
+                last = request.messages[-1].content if request.messages else ""
+                for word in f"[stub:{request.model}] echo: {last}".split(" "):
+                    pieces.append(word + " ")
+                    yield "delta", {"content": word + " "}
+        elif request.tools:
+            # Tool calls arrive as <tool_call> text, not structured deltas, so we
+            # buffer the stream and parse at the end, emitting one tool_calls delta
+            # (or the content if it wasn't a tool call). Plain text isn't token-
+            # streamed here, but a tool-using turn isn't useful half-parsed anyway.
+            kwargs = _effective_kwargs(request, cfg)
+            buf: list[str] = []
+            for chunk in handle.create_chat_completion(**kwargs, stream=True):
                 choice = chunk["choices"][0]
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
-                piece = choice["delta"].get("content") or ""
-                if piece:
-                    pieces.append(piece)
-                    yield "content", piece
+                content = (choice.get("delta") or {}).get("content")
+                if content:
+                    buf.append(content)
+            text = "".join(buf)
+            if text:
+                pieces.append(text)
+            parsed = _parse_tool_calls(text, {t.function.name for t in request.tools})
+            if parsed:
+                yield "delta", {"role": "assistant",
+                                "tool_calls": [{"index": i, **tc} for i, tc in enumerate(parsed)]}
+                finish_reason = "tool_calls"
+            elif text:
+                yield "delta", {"content": text}
+        else:
+            kwargs = _effective_kwargs(request, cfg)
+            for chunk in handle.create_chat_completion(**kwargs, stream=True):
+                choice = chunk["choices"][0]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    pieces.append(delta["content"])
+                if delta:
+                    yield "delta", delta
 
         global _last_used
         _last_used = time.monotonic()

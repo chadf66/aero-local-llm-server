@@ -57,14 +57,24 @@ def chat_completions(request: ChatCompletionRequest):
             status_code=404,
             detail=f"model {request.model!r} not available (have: {engine.available_models()})",
         )
+    if request.tools and not engine.supports_tools(request.model):
+        raise HTTPException(
+            status_code=400,
+            detail=f"model {request.model!r} is not tool-enabled; set `tools = true` in its "
+                   f"config (e.g. a derived model with `from`) to use the `tools` parameter.",
+        )
 
     if not request.stream:
-        text, finish_reason, usage = engine.run_inference(request)
+        message, finish_reason, usage = engine.run_inference(request)
         return ChatCompletionResponse(
             model=request.model,
             choices=[
                 ChatCompletionChoice(
-                    message=ChatMessage(role="assistant", content=text),
+                    message=ChatMessage(
+                        role="assistant",
+                        content=message.get("content"),
+                        tool_calls=message.get("tool_calls"),
+                    ),
                     finish_reason=finish_reason,
                 )
             ],
@@ -74,12 +84,12 @@ def chat_completions(request: ChatCompletionRequest):
     # Streaming: relay the engine's events as OpenAI chat.completion.chunk frames.
     def event_stream():
         for kind, payload in engine.stream_inference(request):
-            if kind == "content":
+            if kind == "delta":
                 yield _sse(
                     {
                         "object": "chat.completion.chunk",
                         "model": request.model,
-                        "choices": [{"index": 0, "delta": {"content": payload}}],
+                        "choices": [{"index": 0, "delta": payload}],
                     }
                 )
             else:  # "end" -> (finish_reason, usage)

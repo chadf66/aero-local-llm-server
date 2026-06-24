@@ -8,9 +8,9 @@ on a memory-constrained MacBook Air. Unlike a fleet server, **the Mac itself is 
 product** — a single process on localhost, single user, one model resident at a
 time, inference on the Metal GPU. No Docker, no router/worker split, no auth.
 
-> **Status:** Phase d done. MVP plus per-model config, config/weights decoupling
-> (one GGUF, many models), and memory-aware auto context sizing. See
-> [PHASES.md](PHASES.md) — tool calling (agents) and a web UI are next.
+> **Status:** Phase e done. MVP plus per-model config, config/weights decoupling
+> (one GGUF, many models), memory-aware auto context sizing, and **tool calling**
+> for agent harnesses. See [PHASES.md](PHASES.md) — a web UI is next.
 
 ## Install
 
@@ -194,9 +194,42 @@ If two models resolve to the same weights and context settings, switching betwee
 them is a **persona swap with no reload** — the engine keeps the model resident and
 just changes the prompt.
 
+## Tool calling (agents)
+
+aero speaks the OpenAI tool-calling API, so agent frameworks pointed at it work
+unmodified. Enable tools on a model with `tools = true`:
+
+```sh
+aero pull NousResearch/Hermes-2-Pro-Mistral-7B-GGUF Hermes-2-Pro-Mistral-7B.Q4_K_M.gguf
+printf 'from = "Hermes-2-Pro-Mistral-7B.Q4_K_M"\ntools = true\n' > ~/.aero/models/hermes-tools.toml
+aero serve
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key="not-needed")
+client.chat.completions.create(model="hermes-tools", tools=[...], messages=[...])
+# -> finish_reason="tool_calls", message.tool_calls=[...]
+```
+
+Runnable examples in [`examples/`](examples/): a raw OpenAI-SDK tool loop and an
+OpenAI Agents SDK agent (`pip install -e ".[examples]"`).
+
+How it works: rather than rely on each GGUF's chat template (many don't render tools
+at all), aero injects the tool definitions into a system prompt itself and parses the
+model's tool-call output back into OpenAI `tool_calls` — handling the common
+`<tool_call>` (Qwen/Hermes), bare-object (Llama-3.1), and bare-array (Ministral)
+formats. Non-streaming and streaming are both supported.
+
+**Model matters for reliability.** Deciding *when* to call a tool is a model skill.
+A model fine-tuned for it (e.g. **Hermes-2-Pro**) calls reliably in `auto` mode; a
+general small model is hit-or-miss. `tool_choice` (a specific function or
+`"required"`) forces a call regardless.
+
 ## API
 
-- `POST /v1/chat/completions` — streaming SSE + non-streaming chat completions.
+- `POST /v1/chat/completions` — streaming SSE + non-streaming chat completions,
+  including `tools` / `tool_choice` and `tool_calls` for tool-enabled models.
 - `GET /v1/models` — lists every available model.
 - `GET /healthz` — liveness, available models, and the one currently resident.
 

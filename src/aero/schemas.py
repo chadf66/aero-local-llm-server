@@ -13,9 +13,40 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
+
+# --------------------------------------------------------------------------- #
+# Tool-calling types (OpenAI "function" tools)
+# --------------------------------------------------------------------------- #
+
+
+class FunctionDef(BaseModel):
+    """A tool's function signature, as sent by the client in ``tools``."""
+
+    name: str
+    description: Optional[str] = None
+    parameters: dict[str, Any] = Field(default_factory=dict)  # JSON Schema
+
+
+class Tool(BaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDef
+
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str          # a JSON string, per the OpenAI wire format
+
+
+class ToolCall(BaseModel):
+    """A tool call the model emitted (and the client should execute)."""
+
+    id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex[:24]}")
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
 
 # --------------------------------------------------------------------------- #
 # Request types
@@ -23,10 +54,17 @@ from pydantic import BaseModel, Field
 
 
 class ChatMessage(BaseModel):
-    """A single turn in the conversation."""
+    """A single turn in the conversation.
 
-    role: Literal["system", "user", "assistant"]
-    content: str
+    ``content`` is optional because an assistant turn that *only* calls tools has
+    null content, and a ``tool`` turn carries a result keyed by ``tool_call_id``.
+    """
+
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
+    name: Optional[str] = None
+    tool_calls: Optional[list[ToolCall]] = None   # assistant -> tool calls it made
+    tool_call_id: Optional[str] = None            # tool -> which call this answers
 
 
 class ChatCompletionRequest(BaseModel):
@@ -46,6 +84,9 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = 40
     seed: Optional[int] = None          # set for reproducible output
     stop: Optional[list[str]] = None    # strings that halt generation
+    # Tool calling. ``tool_choice`` is "auto" | "none" | {"type":"function",...}.
+    tools: Optional[list[Tool]] = None
+    tool_choice: Optional[Union[str, dict]] = None
 
 
 # --------------------------------------------------------------------------- #
