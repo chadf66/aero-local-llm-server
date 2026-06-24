@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aero"
+version = "0.1.0"
+description = "A lean, Mac-native local LLM server with an OpenAI-compatible API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+# Real inference backend. Heavy (compiles llama.cpp against Metal), so it's
+# opt-in: tests run fine on the stub backend without it. `huggingface-hub`
+# powers Llama.from_pretrained() once `pull` lands (Phase c).
+llama = [
+    "llama-cpp-python>=0.2.79",
+    "huggingface-hub>=0.23",
+]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",  # FastAPI's TestClient needs httpx
+]
+
+[project.scripts]
+aero = "aero.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aero"]
