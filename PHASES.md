@@ -89,7 +89,7 @@ acceptance test), then **f** (the UI, which visualizes tools + reasoning).
 ## Phase d — Modelfile config & per-model loading
 
 The shared foundation. Per-model config replaces today's process-global knobs.
-**Config foundation is done; memory-aware auto context sizing is the next cut.**
+**Done.**
 
 - **Modelfile-like per-model config — done.** A TOML model definition
   (`models/<name>.toml`, `config.py`) carries: default `system` prompt, `sampling`
@@ -109,33 +109,27 @@ The shared foundation. Per-model config replaces today's process-global knobs.
   no reload** — only the per-request prompt/sampling differ. `pull` writes the GGUF
   plus a starter definition; `rm` drops the definition (and weights for a base model,
   if nothing else references them).
-- **Memory-aware auto context sizing:** the right `n_ctx` is a function of *both* the
-  model's trained context and the memory available on this machine — the project's
-  memory-first thesis. Evict-before-load helps: only one model is resident, so the
-  budget only has to fit one model at a time. Pick `n_ctx` per load as:
+- **Memory-aware auto context sizing — done.** Set `n_ctx = "auto"` (opt-in) and the
+  engine sizes the context to fit memory at load (`sizing.py`):
 
   ```
-  fit_ctx = (mem_budget − weights − overhead) / (2 × n_layers × kv_dim × bytes_per_token)
-  n_ctx   = min(model_n_ctx_train, fit_ctx)
+  fit_ctx = (budget − weights − overhead) / (2 × n_layers × kv_dim × bytes_per_token)
+  n_ctx   = min(model_n_ctx_train, fit_ctx)         # rounded down to a multiple of 256
   ```
 
-  - `mem_budget`: a fraction of total unified memory (`sysctl hw.memsize`), leaving
-    headroom for macOS + apps (or compute off *free* memory for an adaptive version).
-  - `weights`: ~the GGUF file size, plus a little overhead.
-  - KV-per-token = `2 (K+V) × n_layers × kv_dim × bytes`, where `kv_dim = n_kv_heads ×
-    head_dim` and `bytes` = 2 (f16) / 1 (q8_0) / ~0.5 (q4_0). So `kv_cache_type` is the
-    same lever — quantizing the KV cache frees memory to spend on more context, making
-    this a *joint* choice of (`n_ctx`, `kv_cache_type`).
-  - `n_layers`, `kv_dim`, `model_n_ctx_train`: read cheaply from the **GGUF metadata
-    header** (`<arch>.block_count`, `<arch>.attention.head_count_kv`,
-    `<arch>.context_length`, …) without a full load — the same read would enrich `show`.
-
-  Policy: use the model's full trained context unless it won't fit, else the largest
-  context that does; `--n-ctx` always overrides. Open decisions: (1) budget basis —
-  fraction of *total* vs *free* memory; (2) the headroom fraction / overhead constant
-  (needs empirical calibration); (3) whether to also auto-select a KV quant to hit a
-  target context, or just size `n_ctx` at the chosen precision; (4) behavior when even
-  a minimal context won't fit (refuse to load with a clear message).
+  - **budget** = total unified memory (`os.sysconf`) × `--mem-fraction` (default 0.70).
+    Chosen over *free* memory for run-to-run reproducibility.
+  - **weights** = the GGUF file size; plus a fixed compute/context **overhead**.
+  - **KV-per-token** = `2 (K+V) × n_layers × kv_dim × bytes`, `bytes` = 2/1/0.5 for
+    f16/q8_0/q4_0 — so `kv_cache_type` is the same lever: quantizing the KV cache frees
+    memory for more context (a *joint* (`n_ctx`, `kv_cache_type`) choice the user makes).
+  - `n_layers`, `kv_dim`, `n_ctx_train` come from the **GGUF metadata header**, read via
+    a quick vocab-only llama.cpp load (no weights, no GPU, no extra dependency).
+  - Resolved decisions: budget off *total* memory; size at the chosen KV precision (no
+    auto-quant — the user picks `kv_cache_type`); if even a minimal context won't fit,
+    refuse to load with a clear message (suggesting a smaller quant/model or higher
+    `--mem-fraction`). Verified on 16 GB: Llama-3.1-8B → 50,944 ctx (f16) / 102,144
+    (q8_0) / full 131,072 (q4_0).
 - **Reasoning-model handling (engine side):** models that emit `<think>…</think>` in
   the content need generous `max_tokens`; carry that as a per-model default and
   surface it cleanly. (Rendering of `<think>` is Phase f.)
@@ -178,6 +172,17 @@ off what the engine and models actually do — served by the same FastAPI app.
   collapsible **`<think>`** blocks for reasoning models; inline **tool-call cards**
   (the model requested `f(args)`, here's the result); per-conversation system prompt +
   sampling controls wired to Modelfile defaults; markdown + code highlighting.
+- **Surface the memory knobs, not just sampling.** Alongside temperature / top_p /
+  top_k, expose **`n_ctx` (incl. `auto`)** and **`kv_cache_type` (f16/q8_0/q4_0)** as
+  first-class controls, with a short inline explainer. These are what make bigger
+  open models *feasible* on a constrained Mac, yet they're obscure even to
+  experienced practitioners — surfacing + explaining them in the UI is a genuine
+  differentiator and a teaching moment. Show the trade live: changing `kv_cache_type`
+  should display the resulting max context (we already compute it in `sizing.py`), so
+  the f16→q8_0→q4_0 context gain is visible. Stretch: separate **K vs V** cache
+  precision (K is more sensitive; llama.cpp supports distinct `type_k`/`type_v`, which
+  the engine currently sets equal) — the highest-leverage quality knob when leaning on
+  `q4_0`.
 - **Conversation compaction (summarize & truncate):** long chats overflow `n_ctx`
   (today `aero run` re-sends the full transcript with no windowing — see `_stream_chat`
   in `cli.py`). When the prompt nears the context budget, summarize the oldest turns

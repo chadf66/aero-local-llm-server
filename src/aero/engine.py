@@ -43,6 +43,7 @@ _GGML_TYPE = {"f16": 1, "q8_0": 8, "q4_0": 2}
 _models: dict[str, ModelConfig] = {}   # model name -> its per-model config
 _backend = "llama"
 _idle_timeout = 300.0                  # seconds; 0 disables idle-unload
+_mem_fraction = 0.70                   # fraction of total memory for `n_ctx = "auto"`
 
 # The one resident model, guarded by _lock. _handle is a llama_cpp.Llama (or the
 # name string for the stub backend). All loads, unloads, inference, and the idle
@@ -63,14 +64,16 @@ def configure(
     *,
     backend: str = "llama",
     idle_timeout: float = 300.0,
+    mem_fraction: float = 0.70,
 ) -> None:
     """Install the per-model configs and load policy. Nothing is loaded yet."""
-    global _models, _backend, _idle_timeout
+    global _models, _backend, _idle_timeout, _mem_fraction
     with _lock:
         _unload()  # drop any model loaded under the previous config
         _models = dict(models)
         _backend = backend
         _idle_timeout = float(idle_timeout)
+        _mem_fraction = float(mem_fraction)
     _start_idle_thread()
 
 
@@ -93,14 +96,19 @@ def _load(name: str) -> None:
     global _handle, _loaded_name, _loaded_key, _load_calls
     cfg = _models[name]
 
+    n_ctx = cfg.n_ctx
     if _backend == "stub":
         _handle = name
     elif _backend == "llama":
         from llama_cpp import Llama
 
+        if n_ctx == "auto":
+            from . import sizing
+            n_ctx = sizing.auto_n_ctx(cfg.path, cfg.kv_cache_type, _mem_fraction)
+
         # n_gpu_layers=-1 puts every layer on the Metal GPU -- the whole point on
         # Apple Silicon. Quantized KV cache needs flash attention enabled.
-        kwargs: dict[str, Any] = dict(model_path=cfg.path, n_ctx=cfg.n_ctx, n_gpu_layers=-1, verbose=False)
+        kwargs: dict[str, Any] = dict(model_path=cfg.path, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False)
         if cfg.kv_cache_type != "f16":
             ggml = _GGML_TYPE[cfg.kv_cache_type]
             kwargs.update(type_k=ggml, type_v=ggml, flash_attn=True)
@@ -113,7 +121,7 @@ def _load(name: str) -> None:
     _loaded_name = name
     _loaded_key = cfg.load_key()
     _load_calls += 1
-    logger.info("loaded %s (n_ctx=%d, kv=%s)", name, cfg.n_ctx, cfg.kv_cache_type)
+    logger.info("loaded %s (n_ctx=%s, kv=%s)", name, n_ctx, cfg.kv_cache_type)
 
 
 def _unload() -> None:

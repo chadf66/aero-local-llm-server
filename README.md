@@ -8,9 +8,9 @@ on a memory-constrained MacBook Air. Unlike a fleet server, **the Mac itself is 
 product** — a single process on localhost, single user, one model resident at a
 time, inference on the Metal GPU. No Docker, no router/worker split, no auth.
 
-> **Status:** Phase d (in progress). MVP plus per-model config (Modelfile sidecars).
-> See [PHASES.md](PHASES.md) for the roadmap — memory-aware auto context sizing,
-> then tool calling and a web UI.
+> **Status:** Phase d done. MVP plus per-model config, config/weights decoupling
+> (one GGUF, many models), and memory-aware auto context sizing. See
+> [PHASES.md](PHASES.md) — tool calling (agents) and a web UI are next.
 
 ## Install
 
@@ -92,10 +92,28 @@ carry real `usage` token counts and a real `finish_reason`.
 On a memory-constrained box, the KV cache — not the weights — is what blows the
 budget as context grows (`KV ≈ 2 × layers × kv_dim × n_ctx × 2 bytes` at f16).
 
-- `--n-ctx 8192` — context window size.
+- `--n-ctx 8192` — context window size, or `--n-ctx auto` to size it to memory.
 - `--kv-cache-type q8_0` — quantize the KV cache (`f16` | `q8_0` | `q4_0`) to fit
   more context in the same memory.
+- `--mem-fraction 0.7` — with `auto`, the fraction of total memory to budget.
 - `--idle-timeout 300` — free the resident model after N idle seconds (`0` = never).
+
+**Auto context sizing.** Set `n_ctx = "auto"` (in a model's config, or `--n-ctx auto`)
+and aero picks the largest context that fits your machine — `min(trained context,
+what fits in budget)` — reading the model's dimensions from its GGUF header. Because
+only one model is resident at a time, the budget only has to fit that one model. The
+KV-cache precision is part of the same trade: on 16 GB, Llama-3.1-8B sizes to ~51K
+tokens at `f16`, ~102K at `q8_0`, and its full 131K at `q4_0`.
+
+> **Two different "quantizations" — don't confuse them:**
+> - **Weight quant** (the `Q4_K_M` in a GGUF's filename) compresses the model's
+>   *weights*. It's baked into the file, chosen when you `pull`, and each level is a
+>   **separate GGUF**.
+> - **KV-cache quant** (`kv_cache_type`) compresses the attention *cache* at runtime
+>   to fit more context. It's a config knob on the **same GGUF** — no new download.
+>
+> So one `…Q4_K_M.gguf` serves any of the `f16` / `q8_0` / `q4_0` context sizes above
+> just by changing `kv_cache_type`. The two are independent.
 
 Only one model is ever resident: requesting a different one frees the current
 model **before** loading the next (evict-before-load), so you never hit a
@@ -136,7 +154,7 @@ built-in default. Nothing is required — an empty file is a valid config.
 ```toml
 # ~/.aero/models/Qwen2.5-3B-Instruct-Q4_K_M.toml
 system = "You are a helpful assistant. Be concise."  # default system prompt
-n_ctx = 8192               # context window (tokens)         [default 4096]
+n_ctx = 8192               # context window; an int, or "auto" to size to memory [default 4096]
 kv_cache_type = "q8_0"     # KV-cache precision: f16|q8_0|q4_0 [default f16]
 max_tokens = 2048          # default completion cap (reasoning models want headroom)
 chat_format = "chatml"     # override the GGUF's chat template (rarely needed)
@@ -151,6 +169,11 @@ stop = ["</s>"]
 
 Precedence is **request field > config default > built-in**: a request's own
 `system` message or sampling values always win; the config fills in the rest.
+
+> **Tip:** the default `n_ctx` is a conservative **4096** — short enough that long
+> chats or documents get truncated. Set `n_ctx = "auto"` (or a larger number) to use
+> the context your model and memory actually allow. See
+> [Auto context sizing](#memory--context-tuning).
 
 #### Derived models
 

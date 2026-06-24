@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -46,7 +46,7 @@ class ModelConfig(BaseModel):
     path: str                              # resolved absolute GGUF path (the weights)
     base: Optional[str] = None             # the `from` reference, if any (for display)
     system: Optional[str] = None           # default system prompt (injected if absent)
-    n_ctx: int = 4096
+    n_ctx: Union[int, Literal["auto"]] = 4096   # "auto" = size to memory at load
     kv_cache_type: str = "f16"
     max_tokens: Optional[int] = None        # default completion cap
     chat_format: Optional[str] = None       # llama.cpp chat_format override (e.g. "chatml")
@@ -80,7 +80,7 @@ def load_config_file(
     toml_path: Path,
     gguf_dir: Path,
     *,
-    default_n_ctx: int = 4096,
+    default_n_ctx: Union[int, str] = 4096,
     default_kv_cache_type: str = "f16",
 ) -> ModelConfig:
     """Load one `models/<name>.toml` definition, resolving and checking its weights."""
@@ -113,7 +113,7 @@ def build_registry(
     gguf_dir: Path,
     config_dir: Path,
     *,
-    default_n_ctx: int = 4096,
+    default_n_ctx: Union[int, str] = 4096,
     default_kv_cache_type: str = "f16",
 ) -> dict[str, ModelConfig]:
     """The full model list: every definition in `config_dir`, plus any GGUF in

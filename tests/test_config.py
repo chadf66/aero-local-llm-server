@@ -89,3 +89,17 @@ def test_bad_kv_cache_type_raises(home):
     _toml(home, "Foo", 'kv_cache_type = "q3_0"\n')
     with pytest.raises(ValidationError):
         config.build_registry(home / "gguf", home / "models")
+
+
+def test_n_ctx_auto_is_allowed(home):
+    _gguf(home, "Foo")
+    _toml(home, "Foo", 'n_ctx = "auto"\n')
+    reg = config.build_registry(home / "gguf", home / "models")
+    assert reg["Foo"].n_ctx == "auto"
+
+
+def test_n_ctx_bad_string_rejected(home):
+    _gguf(home, "Foo")
+    _toml(home, "Foo", 'n_ctx = "huge"\n')
+    with pytest.raises(ValidationError):
+        config.build_registry(home / "gguf", home / "models")
