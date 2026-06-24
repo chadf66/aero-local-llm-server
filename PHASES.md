@@ -7,7 +7,8 @@ no Docker, no router/worker split, no auth, memory-first (~16 GB unified memory 
 the tight case). Choices that are right for a multi-client online server are often
 wrong here, and where they differ this doc says so.
 
-Phase a is **implemented**. Phases b–d are recorded here so the work isn't lost.
+Phases a–c are **implemented** (the MVP). Phases d–f are the roadmap, recorded here
+so the work isn't lost.
 
 ---
 
@@ -71,12 +72,119 @@ commands.
   server it started on exit (`/bye`). Streams tokens over the OpenAI API via stdlib
   `urllib` (no extra runtime dep); keeps multi-turn history, `/reset` clears it.
 
-## Phase d — Modelfile config & polish
+## Beyond the MVP: d → e → f
 
-- **Modelfile-like per-model config:** default system prompt, sampling defaults,
-  context size, chat template — stored alongside each model and applied on load.
-- **Reasoning-model handling:** models that emit `<think>…</think>` in the content
-  need generous `max_tokens`; surface/handle this cleanly.
+Phases d, e, and f turn the MVP into a tool-capable, UI-having local stack. They
+build in order on one **guiding principle: the OpenAI-compatible API stays the single
+source of truth.** A web UI and an agent harness are both just clients of
+`/v1/chat/completions`, so the UI dogfoods the exact path agents use. The **inference
+path stays stateless** (every request is self-contained — what keeps agents and the
+CLI clean); the only state we add is a UI-only conversation store (Phase f), which
+never touches inference.
+
+Both the UI and tool calling depend on the Modelfile (per-model chat template /
+format), so **d comes first**, then **e** (tools, with an agent harness as the
+acceptance test), then **f** (the UI, which visualizes tools + reasoning).
+
+## Phase d — Modelfile config & per-model loading
+
+The shared foundation. Per-model config replaces today's process-global knobs.
+**Config foundation is done; memory-aware auto context sizing is the next cut.**
+
+- **Modelfile-like per-model config — done.** A TOML model definition
+  (`models/<name>.toml`, `config.py`) carries: default `system` prompt, `sampling`
+  defaults, `n_ctx`, `kv_cache_type`, `max_tokens`, and a `chat_format` override.
+  `n_ctx`/`kv_cache_type` are now per-model (the `serve` CLI flags are the fallbacks);
+  the engine loads each model with its own config and `show` displays it. Request-time
+  precedence is request field > config default > built-in: the default system prompt
+  is injected only when the request has no system message, and explicit sampling
+  fields (tracked via Pydantic `model_fields_set`) always win.
+- **Config/weights decoupling — done.** The store splits into `~/.aero/gguf/`
+  (weights) and `~/.aero/models/` (definitions). A definition points at weights via
+  `from = "<gguf name>"` or a path, defaulting to the same-named GGUF; a bare GGUF
+  with no definition auto-registers. So **one GGUF can back many named models**
+  (e.g. different system prompts) without copying weights. The engine's
+  `_acquire_handle` compares a `load_key` of `(path, n_ctx, kv_cache_type,
+  chat_format)`: switching between two models that share it is a **persona swap with
+  no reload** — only the per-request prompt/sampling differ. `pull` writes the GGUF
+  plus a starter definition; `rm` drops the definition (and weights for a base model,
+  if nothing else references them).
+- **Memory-aware auto context sizing:** the right `n_ctx` is a function of *both* the
+  model's trained context and the memory available on this machine — the project's
+  memory-first thesis. Evict-before-load helps: only one model is resident, so the
+  budget only has to fit one model at a time. Pick `n_ctx` per load as:
+
+  ```
+  fit_ctx = (mem_budget − weights − overhead) / (2 × n_layers × kv_dim × bytes_per_token)
+  n_ctx   = min(model_n_ctx_train, fit_ctx)
+  ```
+
+  - `mem_budget`: a fraction of total unified memory (`sysctl hw.memsize`), leaving
+    headroom for macOS + apps (or compute off *free* memory for an adaptive version).
+  - `weights`: ~the GGUF file size, plus a little overhead.
+  - KV-per-token = `2 (K+V) × n_layers × kv_dim × bytes`, where `kv_dim = n_kv_heads ×
+    head_dim` and `bytes` = 2 (f16) / 1 (q8_0) / ~0.5 (q4_0). So `kv_cache_type` is the
+    same lever — quantizing the KV cache frees memory to spend on more context, making
+    this a *joint* choice of (`n_ctx`, `kv_cache_type`).
+  - `n_layers`, `kv_dim`, `model_n_ctx_train`: read cheaply from the **GGUF metadata
+    header** (`<arch>.block_count`, `<arch>.attention.head_count_kv`,
+    `<arch>.context_length`, …) without a full load — the same read would enrich `show`.
+
+  Policy: use the model's full trained context unless it won't fit, else the largest
+  context that does; `--n-ctx` always overrides. Open decisions: (1) budget basis —
+  fraction of *total* vs *free* memory; (2) the headroom fraction / overhead constant
+  (needs empirical calibration); (3) whether to also auto-select a KV quant to hit a
+  target context, or just size `n_ctx` at the chosen precision; (4) behavior when even
+  a minimal context won't fit (refuse to load with a clear message).
+- **Reasoning-model handling (engine side):** models that emit `<think>…</think>` in
+  the content need generous `max_tokens`; carry that as a per-model default and
+  surface it cleanly. (Rendering of `<think>` is Phase f.)
+
+## Phase e — Tool calling & agent support
+
+Make the models usable in agent harnesses. The acceptance test: point an existing
+agent framework at `http://127.0.0.1:8317/v1` and have it *just work*. Of the
+installed models, **Llama-3.1-8B, Qwen2.5-3B, and Ministral-8B** are the tool-capable
+ones; TinyLlama/SmolLM/Gemma won't, and DeepSeek-R1 is reasoning-only.
+
+- **Schema extensions (OpenAI-faithful):** add `tools` / `tool_choice` to the request;
+  `tool_calls` on assistant messages; accept `role:"tool"` messages with
+  `tool_call_id`; allow non-string / `null` message content.
+- **Engine:** pass `tools` into llama.cpp's `create_chat_completion` using the
+  per-model chat template / tool format from the Modelfile (Llama-3.1, Qwen, Mistral/
+  Ministral, Hermes, functionary all differ — this is *why* it's gated on Phase d);
+  parse `tool_calls` out of the output and emit `finish_reason:"tool_calls"`.
+- **Sequencing within the phase:** non-streaming tool calls first (clean), then the
+  genuinely hard part — streaming partial `tool_calls` deltas.
+- **Acceptance test:** a real tool loop via the OpenAI Python SDK against localhost,
+  then one framework (e.g. Pydantic AI or the OpenAI Agents SDK). Framework choice TBD
+  when we start.
+
+## Phase f — Web chat UI
+
+A web UI that beats the typical local experience (Open WebUI is the bar) by showing
+off what the engine and models actually do — served by the same FastAPI app.
+
+- **Stack:** a modern SPA (Svelte/React via Vite; framework TBD), built to static
+  assets and mounted by FastAPI at `/`. **Node is a build-time-only dependency** — the
+  runtime stays one `aero serve`, no Node. (Decide later: commit built assets vs build
+  on install.)
+- **Persistence:** server-side SQLite at `~/.aero/aero.db` for **searchable, durable
+  history** (conversations + messages + tool calls) — a concrete "better than Ollama"
+  win. New conversation-CRUD endpoints; this is the *only* server state, and it's kept
+  off the inference path.
+- **Showcase features:** model picker + **live resident-model state** (load / evict /
+  idle-unload, which the engine already tracks); streaming with stop/regenerate;
+  collapsible **`<think>`** blocks for reasoning models; inline **tool-call cards**
+  (the model requested `f(args)`, here's the result); per-conversation system prompt +
+  sampling controls wired to Modelfile defaults; markdown + code highlighting.
+- **Conversation compaction (summarize & truncate):** long chats overflow `n_ctx`
+  (today `aero run` re-sends the full transcript with no windowing — see `_stream_chat`
+  in `cli.py`). When the prompt nears the context budget, summarize the oldest turns
+  into a compact recap and keep the recent tail verbatim; the pinned system prompt must
+  always survive. Applies to both the UI and `run`. Decisions: trigger (~75% of
+  `n_ctx`), how much tail to keep verbatim, same-model vs cheaper summarizer, and
+  excluding `<think>` blocks from what's summarized.
 - README/docs polish, examples, and a short architecture writeup.
 
 ---

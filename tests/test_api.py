@@ -13,16 +13,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 from aero import engine, server
+from aero.config import ModelConfig
 
-# A two-model registry; the stub backend ignores the (fake) paths.
-REGISTRY = {"model-a": "/fake/a.gguf", "model-b": "/fake/b.gguf"}
+# A two-model config set; the stub backend ignores the (fake) paths.
+CONFIGS = {
+    "model-a": ModelConfig(name="model-a", path="/fake/a.gguf"),
+    "model-b": ModelConfig(name="model-b", path="/fake/b.gguf"),
+}
 MODEL = "model-a"
 
 
 @pytest.fixture(autouse=True)
 def stub_engine():
     """Configure the engine in stub mode before each test (idle timer off)."""
-    engine.configure(REGISTRY, backend="stub", idle_timeout=0)
+    engine.configure(CONFIGS, backend="stub", idle_timeout=0)
     yield
 
 
@@ -102,7 +106,7 @@ def test_evict_before_load(client):
 
 def test_idle_unload_seam(client):
     # With a tiny timeout, the idle check frees the model once it's stale.
-    engine.configure(REGISTRY, backend="stub", idle_timeout=0.01)
+    engine.configure(CONFIGS, backend="stub", idle_timeout=0.01)
     client.post("/v1/chat/completions", json={"model": "model-a", "messages": [{"role": "user", "content": "hi"}]})
     assert engine.loaded_model() == "model-a"
     time.sleep(0.05)

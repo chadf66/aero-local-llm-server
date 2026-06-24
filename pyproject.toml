@@ -7,7 +7,7 @@ name = "aero"
 version = "0.1.0"
 description = "A lean, Mac-native local LLM server with an OpenAI-compatible API"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"  # tomllib (per-model config) is stdlib from 3.11
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",

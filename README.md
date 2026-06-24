@@ -8,9 +8,9 @@ on a memory-constrained MacBook Air. Unlike a fleet server, **the Mac itself is 
 product** — a single process on localhost, single user, one model resident at a
 time, inference on the Metal GPU. No Docker, no router/worker split, no auth.
 
-> **Status:** Phase c (MVP). Pull models from Hugging Face, serve them on demand,
-> and chat from the terminal. See [PHASES.md](PHASES.md) for the roadmap — Modelfile
-> per-model config is the next phase.
+> **Status:** Phase d (in progress). MVP plus per-model config (Modelfile sidecars).
+> See [PHASES.md](PHASES.md) for the roadmap — memory-aware auto context sizing,
+> then tool calling and a web UI.
 
 ## Install
 
@@ -32,7 +32,7 @@ make test
 Pull a model from Hugging Face and chat with it — `run` starts a server for you:
 
 ```sh
-# List the GGUF quants in a repo, then pull one into the store (~/.aero/models):
+# List the GGUF quants in a repo, then pull one into the store (~/.aero):
 aero pull bartowski/Qwen2.5-3B-Instruct-GGUF
 aero pull bartowski/Qwen2.5-3B-Instruct-GGUF Qwen2.5-3B-Instruct-Q4_K_M.gguf
 
@@ -40,27 +40,37 @@ aero list                               # what's in the store
 aero run Qwen2.5-3B-Instruct-Q4_K_M     # interactive chat (auto-starts a server)
 ```
 
-In the chat, `/bye` quits and `/reset` clears the conversation. The model store is
-just a folder of `.gguf` files; each is served under its filename stem.
+In the chat, `/bye` quits and `/reset` clears the conversation.
 
 ## Model store
 
+Everything lives under `~/.aero/`, split into **weights** and **definitions**:
+
+```
+~/.aero/
+  gguf/      raw weights (what `aero pull` downloads)
+  models/    model definitions (*.toml) — what you actually run
+```
+
 ```sh
 aero pull <repo> [filename]   # download a GGUF (omit filename to list the repo's quants)
-aero list                     # list local models + sizes
-aero show <name>              # path, size, quantization
-aero rm <name>                # delete a local model (--yes to skip the prompt)
+aero list                     # list models + sizes (derived models show their base)
+aero show <name>              # weights, size, and effective config
+aero rm <name>                # delete a model (--weights also drops the GGUF; --yes skips the prompt)
 ```
+
+A *model* is a definition that points at weights. A bare GGUF with no definition
+still works (it auto-registers with defaults), so `pull` + `run` just works.
 
 ## Serve models
 
-Drop your GGUF files in a directory and point `serve` at it. Each file is served
-as a model named after its filename stem; they're loaded on demand, one at a time.
+`serve` reads the aero home (`~/.aero` by default), serving every model in it,
+loaded on demand, one resident at a time.
 
 ```sh
-aero serve --models-dir ~/.aero/models          # the default dir
-# or serve specific files (repeatable), and/or override the port:
-.venv/bin/aero serve --model /path/to/a.gguf --model /path/to/b.gguf --port 8317
+aero serve                                      # serves ~/.aero
+# point at a different home, serve ad-hoc files, and/or override the port:
+.venv/bin/aero serve --home /path/to/home --model /extra/a.gguf --port 8317
 # via make:
 make serve MODEL=/path/to/model.gguf            # add PORT=8088 to override
 ```
@@ -90,6 +100,76 @@ budget as context grows (`KV ≈ 2 × layers × kv_dim × n_ctx × 2 bytes` at f
 Only one model is ever resident: requesting a different one frees the current
 model **before** loading the next (evict-before-load), so you never hit a
 two-models-in-memory peak.
+
+### Per-model config & derived models
+
+A model definition is a TOML file in `~/.aero/models/`. The **filename is the model
+name** — `~/.aero/models/<name>.toml` defines the model you call as `<name>`. That's
+the whole rule: to configure a model, create (or edit) the `.toml` with its name.
+
+#### How to create one
+
+There's no special command and no DSL — it's just a file. Three ways to get one:
+
+1. **From `pull`** — `aero pull` already drops a starter `models/<name>.toml` next to
+   the weights, with every field present but commented out. Open it and uncomment what
+   you want.
+2. **For a model you already have** — write the file yourself. The name must match the
+   model (for a plain GGUF, that's its filename stem):
+   ```sh
+   $EDITOR ~/.aero/models/Qwen2.5-3B-Instruct-Q4_K_M.toml
+   ```
+3. **As a new persona over existing weights** — give it any new name and point `from`
+   at the base (see *Derived models* below).
+
+After editing, check what the server will actually use:
+
+```sh
+aero show Qwen2.5-3B-Instruct-Q4_K_M    # prints the effective config
+```
+
+#### Every field
+
+All fields are optional; omit one and it falls back to the `serve` flag, then the
+built-in default. Nothing is required — an empty file is a valid config.
+
+```toml
+# ~/.aero/models/Qwen2.5-3B-Instruct-Q4_K_M.toml
+system = "You are a helpful assistant. Be concise."  # default system prompt
+n_ctx = 8192               # context window (tokens)         [default 4096]
+kv_cache_type = "q8_0"     # KV-cache precision: f16|q8_0|q4_0 [default f16]
+max_tokens = 2048          # default completion cap (reasoning models want headroom)
+chat_format = "chatml"     # override the GGUF's chat template (rarely needed)
+from = "..."               # use another model's weights (see below)
+
+[sampling]                 # defaults applied when the request doesn't set them
+temperature = 0.7
+top_p = 0.9
+top_k = 40
+stop = ["</s>"]
+```
+
+Precedence is **request field > config default > built-in**: a request's own
+`system` message or sampling values always win; the config fills in the rest.
+
+#### Derived models
+
+Point `from` at another model's weights so one GGUF can back several personas without
+copying it. The new file's name is the new model's name:
+
+```toml
+# ~/.aero/models/qwen-pirate.toml
+from = "Qwen2.5-3B-Instruct-Q4_K_M"   # a GGUF name in gguf/, or a path to a .gguf
+system = "You are a pirate. Answer in pirate speak."
+```
+
+```sh
+aero run qwen-pirate     # same weights as Qwen, different personality
+```
+
+If two models resolve to the same weights and context settings, switching between
+them is a **persona swap with no reload** — the engine keeps the model resident and
+just changes the prompt.
 
 ## API
 
