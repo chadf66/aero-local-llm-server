@@ -41,8 +41,8 @@ _STARTER_TEMPLATE = """\
 # Tip: `aero show {name}` prints the config the server will actually use.
 
 # system = "You are a helpful assistant."   # default system prompt
-# n_ctx = 4096                              # context window (tokens)
-# kv_cache_type = "f16"                     # KV-cache precision: f16 | q8_0 | q4_0
+# n_ctx = 4096                              # context window: an int, or "auto" to size to memory
+# kv_cache_type = "f16"                     # KV-cache precision: f16 | q8_0 | q4_0  (q8_0/q4_0 fit more context)
 # max_tokens = 2048                         # default completion cap
 # chat_format = "chatml"                    # override the GGUF's chat template (rarely needed)
 
@@ -79,9 +79,12 @@ def serve(
     ),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address (localhost only by default)."),
     port: int = typer.Option(8317, "--port", "-p", help="Port to listen on."),
-    n_ctx: int = typer.Option(4096, "--n-ctx", help="Default context window (per-model config overrides)."),
+    n_ctx: str = typer.Option("4096", "--n-ctx", help="Default context window, or 'auto' to size to memory."),
     kv_cache_type: str = typer.Option(
         "f16", "--kv-cache-type", help="Default KV-cache precision: f16 | q8_0 | q4_0."
+    ),
+    mem_fraction: float = typer.Option(
+        0.70, "--mem-fraction", help="Fraction of total memory to budget when n_ctx is 'auto'."
     ),
     idle_timeout: int = typer.Option(
         300, "--idle-timeout", help="Free the resident model after N idle seconds (0 = never)."
@@ -95,16 +98,22 @@ def serve(
 
     if kv_cache_type not in config.KV_CACHE_TYPES:
         raise typer.BadParameter(f"--kv-cache-type must be one of {', '.join(config.KV_CACHE_TYPES)}")
+    if n_ctx == "auto":
+        default_n_ctx: object = "auto"
+    elif n_ctx.isdigit():
+        default_n_ctx = int(n_ctx)
+    else:
+        raise typer.BadParameter("--n-ctx must be a positive integer or 'auto'")
 
     registry = config.build_registry(
         store.gguf_dir(home), store.config_dir(home),
-        default_n_ctx=n_ctx, default_kv_cache_type=kv_cache_type,
+        default_n_ctx=default_n_ctx, default_kv_cache_type=kv_cache_type,
     )
     for path in model:
         if not path.exists():
             raise typer.BadParameter(f"model file not found: {path}")
         registry[path.stem] = config.ModelConfig(
-            name=path.stem, path=str(path), n_ctx=n_ctx, kv_cache_type=kv_cache_type
+            name=path.stem, path=str(path), n_ctx=default_n_ctx, kv_cache_type=kv_cache_type
         )
     if not registry:
         raise typer.BadParameter(
@@ -112,7 +121,7 @@ def serve(
         )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    engine.configure(registry, backend="llama", idle_timeout=idle_timeout)
+    engine.configure(registry, backend="llama", idle_timeout=idle_timeout, mem_fraction=mem_fraction)
 
     typer.echo(f"Serving {len(registry)} model(s) on http://{host}:{port}  (base_url: http://{host}:{port}/v1)")
     typer.echo(f"  models: {', '.join(sorted(registry))}")
