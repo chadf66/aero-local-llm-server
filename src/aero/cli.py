@@ -26,36 +26,12 @@ from typing import Iterator, Optional
 
 import typer
 
-from . import config, store
+from . import config, store, store_ops
 
 app = typer.Typer(help="aero — a lean, Mac-native local LLM server.", no_args_is_help=True)
 
 # Reusable option so every command points at the same home by default.
 _home_opt = typer.Option(store.DEFAULT_HOME, "--home", help="aero home directory.")
-
-_STARTER_TEMPLATE = """\
-# aero model definition for `{name}`.
-# Weights: gguf/{name}.gguf (resolved from this file's name).
-# Every field is optional and shown commented out with its default. Uncomment and
-# edit what you want; an empty file is a valid config (pure defaults).
-# Tip: `aero show {name}` prints the config the server will actually use.
-
-# system = "You are a helpful assistant."   # default system prompt
-# n_ctx = 4096                              # context window: an int, or "auto" to size to memory
-# kv_cache_type = "f16"                     # KV-cache precision: f16 | q8_0 | q4_0  (q8_0/q4_0 fit more context)
-# max_tokens = 2048                         # default completion cap
-# tools = true                              # enable tool/function calling (agents)
-# chat_format = "chatml"                    # override the GGUF's chat template (rarely needed)
-
-# To make a variant that reuses these weights, create another .toml (any name) with:
-#   from = "{name}"
-
-# [sampling]                                # defaults used when the request doesn't set them
-# temperature = 0.7
-# top_p = 0.95
-# top_k = 40
-# stop = ["</s>"]
-"""
 
 
 @app.callback()
@@ -122,7 +98,11 @@ def serve(
         )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    engine.configure(registry, backend="llama", idle_timeout=idle_timeout, mem_fraction=mem_fraction)
+    engine.configure(
+        registry, backend="llama", idle_timeout=idle_timeout, mem_fraction=mem_fraction,
+        home=home,
+        registry_defaults={"default_n_ctx": default_n_ctx, "default_kv_cache_type": kv_cache_type},
+    )
     db.connect(home)  # web-UI conversation history (off the inference path)
 
     typer.echo(f"Serving {len(registry)} model(s) on http://{host}:{port}  (base_url: http://{host}:{port}/v1)")
@@ -152,31 +132,34 @@ def pull(
 ) -> None:
     """Download a GGUF from Hugging Face and create a model definition."""
     try:
-        from huggingface_hub import HfApi, hf_hub_download
+        import huggingface_hub  # noqa: F401  (store_ops imports it lazily)
     except ImportError as exc:
         raise typer.BadParameter("huggingface-hub not installed; run `make install-metal` (or pip install .[llama])") from exc
 
     if filename is None:
-        ggufs = sorted(f for f in HfApi().list_repo_files(repo) if f.endswith(".gguf"))
+        ggufs = store_ops.list_repo_ggufs(repo)
         if not ggufs:
             raise typer.BadParameter(f"no .gguf files found in {repo}")
         typer.echo(f"GGUF files in {repo}:")
         for f in ggufs:
-            typer.echo(f"  {f}")
-        typer.echo(f"\nRe-run with one, e.g.:  aero pull {repo} {ggufs[0]}")
+            size = f"  ({store.human_size(f['size'])})" if f.get("size") else ""
+            typer.echo(f"  {f['filename']}{size}")
+        typer.echo(f"\nRe-run with one, e.g.:  aero pull {repo} {ggufs[0]['filename']}")
         return
 
     gguf_dir = store.gguf_dir(home)
-    gguf_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"Downloading {repo}/{filename} -> {gguf_dir} ...")
-    path = Path(hf_hub_download(repo_id=repo, filename=filename, local_dir=str(gguf_dir)))
 
-    # Write a starter definition unless one already exists.
-    config_dir = store.config_dir(home)
-    config_dir.mkdir(parents=True, exist_ok=True)
-    toml_path = config_dir / f"{path.stem}.toml"
-    if not toml_path.exists():
-        toml_path.write_text(_STARTER_TEMPLATE.format(name=path.stem))
+    def progress(downloaded: int, total: int) -> None:
+        if total:
+            print(f"\r  {store.human_size(downloaded)} / {store.human_size(total)} "
+                  f"({downloaded / total * 100:5.1f}%)", end="", flush=True)
+        else:
+            print(f"\r  {store.human_size(downloaded)}", end="", flush=True)
+
+    path = store_ops.download_gguf(repo, filename, gguf_dir, progress_cb=progress)
+    print()  # end the progress line
+    toml_path = store_ops.write_starter_config(home, path.stem)
     typer.echo(f"Pulled {path.stem}  ({store.human_size(path.stat().st_size)})")
     typer.echo(f"  definition: {toml_path}")
 
@@ -243,40 +226,20 @@ def rm(
     """Delete a model. Derived models drop just their definition; base models can
     also drop their weights (unless another model still references them)."""
     registry = _registry(home)
-    cfg = registry.get(name)
-    if cfg is None:
+    if name not in registry:
         raise typer.BadParameter(f"no model named {name!r} in {home}")
 
-    toml_path = store.config_dir(home) / f"{name}.toml"
-    weights_path = Path(cfg.path)
-    # Other models pointing at the same weights (so we don't orphan them).
-    referenced_by = [n for n, c in registry.items() if n != name and c.path == cfg.path]
-
-    to_delete: list[Path] = []
-    if toml_path.is_file():
-        to_delete.append(toml_path)
-
-    drop_weights = weights or (cfg.base is None and not toml_path.is_file())  # orphan GGUF: weights are the model
-    if drop_weights:
-        if cfg.base is not None:
-            typer.echo("Refusing --weights on a derived model (its weights belong to the base).")
-        elif referenced_by:
-            typer.echo(f"Keeping weights — still referenced by: {', '.join(sorted(referenced_by))}")
-        elif weights_path.is_file():
-            to_delete.append(weights_path)
-
-    if not to_delete:
-        typer.echo(f"Nothing to delete for {name} (definition-less GGUF still referenced, or already gone).")
-        return
-
     if not yes:
-        typer.echo("Will delete:")
-        for p in to_delete:
-            typer.echo(f"  {p}")
-        typer.confirm("Proceed?", abort=True)
-    for p in to_delete:
-        p.unlink()
-    typer.echo(f"Removed {name}")
+        extra = " and its weights" if weights else ""
+        typer.confirm(f"Delete model {name!r}{extra}?", abort=True)
+
+    result = store_ops.delete_model(home, name, registry, weights=weights)
+    for p in result["deleted"]:
+        typer.echo(f"  removed {p}")
+    if result["note"]:
+        typer.echo(result["note"])
+    typer.echo(f"Removed {name}" if result["deleted"]
+               else f"Nothing to delete for {name} (weights still referenced, or already gone).")
 
 
 # =========================================================================== #

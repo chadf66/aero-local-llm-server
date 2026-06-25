@@ -39,6 +39,8 @@
       <p class="small muted empty">No chats yet.</p>
     {/each}
   </div>
+
+  <button class="manage" on:click={() => dispatch("manage")}>⚙ Manage models</button>
 </aside>
 
 <style>
@@ -92,4 +94,14 @@
   .item:hover .del { opacity: 1; }
   .del:hover { color: var(--danger); background: var(--hover); }
   .empty { padding: 0.6rem; }
+  .manage {
+    margin-top: auto;
+    width: 100%;
+    justify-content: flex-start;
+    text-align: left;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .manage:hover { color: var(--text); }
 </style>

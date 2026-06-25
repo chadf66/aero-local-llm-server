@@ -4,6 +4,7 @@
   import Sidebar from "./lib/Sidebar.svelte";
   import Message from "./lib/Message.svelte";
   import Knobs from "./lib/Knobs.svelte";
+  import ModelsView from "./lib/ModelsView.svelte";
 
   const emptyChat = () => ({ id: null, title: "New chat", model: "", system: "", messages: [] });
 
@@ -20,6 +21,15 @@
 
   let knobs = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: null };
   let showSettings = false;
+  let view = "chat"; // "chat" | "models"
+
+  async function onModelsChanged() {
+    await refreshState();
+    // If the selected model was deleted, fall back to the first available one.
+    if (model && !serverState.models.some((m) => m.name === model)) {
+      model = serverState.models[0]?.name ?? "";
+    }
+  }
 
   $: modelInfo = serverState.models.find((m) => m.name === model) || null;
   // Map tool results (role:"tool") to their call id so ToolCards can show them.
@@ -184,12 +194,16 @@
   <Sidebar
     {conversations}
     currentId={current?.id}
-    on:new={newChat}
-    on:open={(e) => openChat(e.detail)}
+    on:new={() => { newChat(); view = "chat"; }}
+    on:open={(e) => { openChat(e.detail); view = "chat"; }}
     on:delete={(e) => removeChat(e.detail)}
     on:search={(e) => refreshList(e.detail)}
+    on:manage={() => (view = "models")}
   />
 
+  {#if view === "models"}
+    <ModelsView on:back={() => (view = "chat")} on:changed={onModelsChanged} />
+  {:else}
   <main>
     <header>
       <div class="modelpick">
@@ -290,6 +304,7 @@
       </label>
       <Knobs {knobs} {model} {modelInfo} />
     </aside>
+  {/if}
   {/if}
 </div>
 

@@ -7,8 +7,9 @@ no Docker, no router/worker split, no auth, memory-first (~16 GB unified memory 
 the tight case). Choices that are right for a multi-client online server are often
 wrong here, and where they differ this doc says so.
 
-Phases a–e and **f1** are **implemented**. Phase **f2** (model management from the
-UI) is the remaining roadmap item, recorded here so the work isn't lost.
+Phases a–f are **implemented** — the roadmap is complete. What remains
+(conversation compaction, a separate-K/V stretch knob, docs polish) is noted as
+future work, recorded here so it isn't lost.
 
 ---
 
@@ -197,22 +198,31 @@ The build output is generated, so it's gitignored rather than committed.
   editor. Stretch, still open: separate **K vs V** precision — the engine sets `type_k`/
   `type_v` equal today.)
 
-### Phase f2 — Model management from the UI (next)
+### Phase f2 — Model management from the UI (done)
 
-Make aero configurable from the browser, reusing the CLI's existing logic
-(`cli.py`'s `pull`/`rm`/`_STARTER_TEMPLATE`, `config.ModelConfig`).
+aero is configurable from the browser, reusing one store-ops code path so the UI and
+CLI never drift (`store_ops.py`; the CLI's `pull`/`rm` now call it too).
 
-- **Admin API** (`/api/models …`): list a repo's GGUF quants + **pull with live
-  progress** (SSE), create/edit a `.toml` definition from a validated form (round-trips
-  through `ModelConfig`), and delete (mirroring `aero rm`'s orphan-safety).
-- **Live registry reload:** `engine.reload(registry)` that refreshes the model set under
-  the lock **without** dropping a still-valid resident model (today `configure()` always
-  `_unload()`s) — so a pull/create/edit/delete takes effect with no server restart.
-- **Management UI:** a "Models" view — browse/pull, a config editor surfacing the same
-  knobs (system, n_ctx/auto, kv_cache_type, sampling, tools, derived `from`) with the
-  live `/api/sizing` preview, and delete with guardrails.
+- **Reusable store ops — done.** `store_ops.py`: `list_repo_ggufs`, a **streamed**
+  `download_gguf` (plain `urllib` GET off `hf_hub_url`, with a `progress_cb` — so both
+  the UI *and* `aero pull` show real progress; honors `HF_TOKEN`), `write_model_config`
+  (validates via `ModelConfig`, then a tiny hand-rolled TOML writer — no new deps),
+  `delete_model` (the `aero rm` orphan-safety), and `sanitize_name`.
+- **Live registry reload — done.** `engine.reload(models)` swaps the model set under the
+  lock and **keeps the resident model loaded** iff its `load_key` is unchanged (only a
+  vanished/changed resident is evicted). `engine.reload_from_disk()` rebuilds via
+  `build_registry` (the serve-time `home`/defaults are remembered in `configure`) and is
+  called after every pull/create/edit/delete — changes apply with **no restart**.
+- **Admin API — done.** `/api/models` (installed list w/ size, base, config,
+  `referenced_by`), `/api/models/repo` (repo quants), `/api/models/pull` (**SSE progress**,
+  single-pull lock, writes a starter config + reloads on completion), `POST`/`PUT`
+  (create/edit; 400 with the validation message), `DELETE` (orphan-safe).
+- **Management UI — done.** A "Models" view (sidebar → *Manage models*): pull panel with
+  a progress bar, installed table with badges + edit/delete, and a config-editor **form**
+  (system, n_ctx/`auto`, kv_cache_type, max_tokens, tools, derived `from`) with the live
+  `/api/sizing` max-context preview reused from the chat knobs.
 
-### Phase f — still open (either f2 or a follow-up)
+## Future work (post-roadmap)
 
 - **Conversation compaction (summarize & truncate):** long chats overflow `n_ctx`
   (today `aero run` re-sends the full transcript with no windowing — see `_stream_chat`
@@ -221,6 +231,9 @@ Make aero configurable from the browser, reusing the CLI's existing logic
   always survive. Applies to both the UI and `run`. Decisions: trigger (~75% of
   `n_ctx`), how much tail to keep verbatim, same-model vs cheaper summarizer, and
   excluding `<think>` blocks from what's summarized.
+- **Separate K vs V cache precision** (stretch): the engine sets `type_k`/`type_v` equal
+  today; distinct precisions (K is more sensitive) are the highest-leverage quality knob
+  when leaning on `q4_0`. Would extend the config + the editor.
 - README/docs polish, examples, and a short architecture writeup.
 
 ---

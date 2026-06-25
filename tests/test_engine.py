@@ -68,3 +68,34 @@ def test_no_reload_when_personas_share_weights():
     engine.run_inference(_req(model="other"))
     assert engine.loaded_model() == "other"
     assert engine._load_calls == start + 2
+
+
+def test_reload_preserves_resident_when_load_key_unchanged():
+    a = ModelConfig(name="a", path="/fake/a.gguf")
+    b = ModelConfig(name="b", path="/fake/b.gguf")
+    engine.configure({"a": a, "b": b}, backend="stub", idle_timeout=0)
+    engine.run_inference(_req(model="a"))
+    calls = engine._load_calls
+    assert engine.loaded_model() == "a"
+
+    # Reload with `a` unchanged (and `b` edited) -> resident `a` stays loaded, no reload.
+    engine.reload({"a": a, "b": ModelConfig(name="b", path="/fake/b.gguf", system="new")})
+    assert engine.loaded_model() == "a"
+    assert engine._load_calls == calls
+
+
+def test_reload_unloads_resident_when_removed_or_changed():
+    a = ModelConfig(name="a", path="/fake/a.gguf")
+    engine.configure({"a": a}, backend="stub", idle_timeout=0)
+    engine.run_inference(_req(model="a"))
+    assert engine.loaded_model() == "a"
+
+    # Resident model's load-affecting config changed -> drop it (next request reloads).
+    engine.reload({"a": ModelConfig(name="a", path="/fake/a.gguf", n_ctx=8192)})
+    assert engine.loaded_model() is None
+
+    engine.run_inference(_req(model="a"))
+    assert engine.loaded_model() == "a"
+    # Resident model removed entirely -> unloaded.
+    engine.reload({})
+    assert engine.loaded_model() is None
