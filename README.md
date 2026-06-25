@@ -8,11 +8,10 @@ on a memory-constrained MacBook Air. Unlike a fleet server, **the Mac itself is 
 product** — a single process on localhost, single user, one model resident at a
 time, inference on the Metal GPU. No Docker, no router/worker split, no auth.
 
-> **Status:** Phase f2 done — the roadmap is complete. MVP plus per-model config,
-> config/weights decoupling (one GGUF, many models), memory-aware auto context sizing,
-> **tool calling** for agent harnesses, and a **web UI** with searchable history *and*
-> full **model management** (pull, create/edit configs, delete — applied live, no
-> restart). See [PHASES.md](PHASES.md).
+> **Status:** feature-complete. MVP plus per-model config, config/weights decoupling
+> (one GGUF, many models), memory-aware auto context sizing, **tool calling** for agent
+> harnesses, and a **web UI** with searchable history *and* full **model management**
+> (pull, create/edit configs, delete — applied live, no restart).
 
 ## Install
 
