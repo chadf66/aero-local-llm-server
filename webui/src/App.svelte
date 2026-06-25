@@ -19,6 +19,7 @@
   let scroller;
 
   let knobs = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: null };
+  let showSettings = false;
 
   $: modelInfo = serverState.models.find((m) => m.name === model) || null;
   // Map tool results (role:"tool") to their call id so ToolCards can show them.
@@ -191,132 +192,223 @@
 
   <main>
     <header>
-      <select bind:value={model} disabled={generating}>
-        {#each serverState.models as m}
-          <option value={m.name}>{m.name}{m.tools ? "  ⚙︎" : ""}</option>
-        {/each}
-      </select>
-      <span class="resident small">
-        resident:
+      <div class="modelpick">
+        <select bind:value={model} disabled={generating}>
+          {#each serverState.models as m}
+            <option value={m.name}>{m.name}{m.tools ? "  ⚙︎" : ""}</option>
+          {/each}
+        </select>
+        <span class="chev" aria-hidden="true">▾</span>
+      </div>
+      <span class="resident small" title="Model currently held in memory">
         {#if serverState.loaded}
-          <span class="dot ok"></span>{serverState.loaded}
+          <span class="dot ok"></span><span class="muted">{serverState.loaded}</span>
         {:else}
-          <span class="dot"></span><span class="muted">none (idle)</span>
+          <span class="dot"></span><span class="muted">idle</span>
         {/if}
       </span>
       <div class="spacer"></div>
-      <input
-        class="sysprompt"
-        placeholder="System prompt (optional)…"
-        bind:value={current.system}
-        disabled={generating || (current.id != null && current.messages.length > 0)}
-      />
+      <button class="iconbtn" class:active={showSettings} title="Settings"
+              on:click={() => (showSettings = !showSettings)}>⚙</button>
     </header>
 
     <div class="scroll" bind:this={scroller}>
-      {#if offline}
-        <div class="notice">
-          <strong>Can't reach the aero server.</strong>
-          <p class="small muted">
-            Start it in another terminal with <code>aero serve</code> (it listens on
-            <code>:8317</code>). In dev mode the Vite server proxies <code>/api</code> and
-            <code>/v1</code> there.
-          </p>
-        </div>
-      {:else if serverState.models.length === 0}
-        <div class="notice">
-          <strong>No models available.</strong>
-          <p class="small muted">
-            Pull one with <code>aero pull &lt;repo&gt;</code>, then restart
-            <code>aero serve</code>.
-          </p>
-        </div>
-      {:else if current.messages.length === 0}
-        <div class="notice muted">
-          <p>Chatting with <strong>{model}</strong>. Ask anything below.</p>
-        </div>
-      {/if}
+      <div class="col">
+        {#if offline}
+          <div class="notice">
+            <strong>Can't reach the aero server.</strong>
+            <p class="small muted">
+              Start it in another terminal with <code>aero serve</code> (it listens on
+              <code>:8317</code>). In dev mode the Vite server proxies <code>/api</code> and
+              <code>/v1</code> there.
+            </p>
+          </div>
+        {:else if serverState.models.length === 0}
+          <div class="notice">
+            <strong>No models available.</strong>
+            <p class="small muted">
+              Pull one with <code>aero pull &lt;repo&gt;</code>, then restart
+              <code>aero serve</code>.
+            </p>
+          </div>
+        {:else if current.messages.length === 0}
+          <div class="hero">
+            <h1>What can I help with?</h1>
+            <p class="muted small">Chatting with <strong>{model}</strong></p>
+          </div>
+        {/if}
 
-      {#each current.messages.filter((m) => m.role !== "tool") as m (m)}
-        <Message message={m} {toolResults} />
-      {/each}
-      {#if error}<div class="error small">{error}</div>{/if}
+        {#each current.messages.filter((m) => m.role !== "tool") as m (m)}
+          <Message message={m} {toolResults} />
+        {/each}
+        {#if error}<div class="error small">{error}</div>{/if}
+      </div>
     </div>
 
     <footer>
-      {#if generating}
-        <button class="stop" on:click={stop}>■ Stop</button>
-      {:else}
-        <button class="ghost" on:click={regenerate} disabled={!canRegen()}>↻ Regenerate</button>
-      {/if}
-      <textarea
-        rows="1"
-        placeholder="Message {model || "—"}…  (Enter to send, Shift+Enter for newline)"
-        bind:value={input}
-        on:keydown={onKey}
-        disabled={generating || !model}
-      ></textarea>
-      <button class="primary" on:click={send} disabled={generating || !input.trim() || !model}>Send</button>
+      <div class="col composer-col">
+        {#if canRegen()}
+          <div class="actions">
+            <button class="pill small" on:click={regenerate}>↻ Regenerate</button>
+          </div>
+        {/if}
+        <div class="composer" class:disabled={!model}>
+          <textarea
+            rows="1"
+            placeholder={model ? `Message ${model}…` : "No model available"}
+            bind:value={input}
+            on:keydown={onKey}
+            disabled={generating || !model}
+          ></textarea>
+          {#if generating}
+            <button class="send stop" on:click={stop} title="Stop">■</button>
+          {:else}
+            <button class="send" on:click={send}
+                    disabled={!input.trim() || !model} title="Send">↑</button>
+          {/if}
+        </div>
+        <p class="disclaimer small muted">Local models can make mistakes. Responses run on your Mac.</p>
+      </div>
     </footer>
   </main>
 
-  <Knobs {knobs} {model} {modelInfo} />
+  {#if showSettings}
+    <aside class="settings">
+      <div class="settings-head">
+        <span>Settings</span>
+        <button class="iconbtn" title="Close" on:click={() => (showSettings = false)}>✕</button>
+      </div>
+      <label class="field small">
+        System prompt
+        <textarea
+          class="sysprompt"
+          rows="3"
+          placeholder="Optional — sets the assistant's behavior for this chat"
+          bind:value={current.system}
+          disabled={generating || (current.id != null && current.messages.length > 0)}
+        ></textarea>
+      </label>
+      <Knobs {knobs} {model} {modelInfo} />
+    </aside>
+  {/if}
 </div>
 
 <style>
-  .app { display: flex; height: 100vh; }
+  .app { display: flex; height: 100vh; overflow: hidden; }
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  /* Centered conversation + composer column, ChatGPT-style. */
+  .col { width: 100%; max-width: var(--col); margin: 0 auto; }
+
   header {
     display: flex;
     align-items: center;
-    gap: 0.7rem;
-    padding: 0.6rem 0.9rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
+    gap: 0.6rem;
+    padding: 0.55rem 0.9rem;
+    height: 3rem;
   }
-  .spacer { flex: 1; }
-  .sysprompt { width: 40%; min-width: 12rem; }
+  .modelpick { position: relative; display: inline-flex; align-items: center; }
+  .modelpick select {
+    appearance: none;
+    background: transparent;
+    border: none;
+    font-weight: 600;
+    font-size: 1rem;
+    padding: 0.35rem 1.6rem 0.35rem 0.5rem;
+    border-radius: 8px;
+    cursor: pointer;
+    max-width: 22rem;
+  }
+  .modelpick select:hover { background: var(--hover); }
+  .modelpick .chev { position: absolute; right: 0.55rem; pointer-events: none; color: var(--muted); font-size: 0.75rem; }
   .resident { display: flex; align-items: center; gap: 0.35rem; }
-  .dot {
-    width: 0.55rem;
-    height: 0.55rem;
-    border-radius: 50%;
-    background: var(--muted);
-    display: inline-block;
-  }
-  .dot.ok { background: var(--ok); }
-  .scroll { flex: 1; overflow-y: auto; padding: 1rem 1.2rem; }
+  .dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .spacer { flex: 1; }
+  .iconbtn { font-size: 1.05rem; line-height: 1; padding: 0.4rem 0.5rem; border-radius: 8px; }
+  .iconbtn.active { background: var(--hover); }
+
+  .scroll { flex: 1; overflow-y: auto; padding: 1rem 1rem 0; }
+
+  .hero { text-align: center; padding: 18vh 1rem 2rem; }
+  .hero h1 { font-size: 1.7rem; font-weight: 600; margin: 0 0 0.4rem; }
+
   .notice {
-    max-width: 40rem;
-    margin: 2rem auto;
+    max-width: 34rem;
+    margin: 14vh auto 2rem;
     text-align: center;
     border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 1.2rem 1.4rem;
-    background: var(--panel);
+    border-radius: 12px;
+    padding: 1.3rem 1.5rem;
+    background: var(--sidebar);
   }
-  .notice p { line-height: 1.5; }
+  .notice p { line-height: 1.5; margin: 0.5rem 0 0; }
   .error {
     color: var(--danger);
     border: 1px solid var(--danger);
-    border-radius: 6px;
-    padding: 0.5rem 0.7rem;
-    margin: 0.5rem 0;
+    border-radius: 8px;
+    padding: 0.5rem 0.75rem;
+    margin: 0.6rem 0;
   }
-  footer {
+
+  /* Composer */
+  footer { padding: 0.4rem 1rem 0.6rem; }
+  .composer-col { display: flex; flex-direction: column; align-items: stretch; }
+  .actions { display: flex; justify-content: center; margin-bottom: 0.5rem; }
+  .pill { border: 1px solid var(--border); border-radius: 999px; padding: 0.3rem 0.85rem; }
+  .composer {
     display: flex;
-    gap: 0.5rem;
     align-items: flex-end;
-    padding: 0.7rem 0.9rem;
-    border-top: 1px solid var(--border);
-    background: var(--panel);
+    gap: 0.5rem;
+    background: var(--elevated);
+    border: 1px solid var(--border);
+    border-radius: 1.6rem;
+    padding: 0.4rem 0.5rem 0.4rem 1rem;
   }
-  textarea {
+  .composer:focus-within { border-color: var(--elevated-2); }
+  .composer.disabled { opacity: 0.6; }
+  .composer textarea {
     flex: 1;
+    background: transparent;
+    border: none;
     resize: none;
-    max-height: 9rem;
-    min-height: 2.4rem;
-    line-height: 1.4;
+    max-height: 12rem;
+    min-height: 1.6rem;
+    padding: 0.45rem 0;
+    line-height: 1.5;
   }
-  .stop { border-color: var(--danger); color: var(--danger); }
+  .composer textarea:focus { border: none; }
+  .send {
+    flex: 0 0 auto;
+    width: 2.1rem;
+    height: 2.1rem;
+    border-radius: 50%;
+    background: var(--text);
+    color: #111;
+    font-size: 1.05rem;
+    display: grid;
+    place-items: center;
+    padding: 0;
+  }
+  .send:hover { background: #fff; }
+  .send:disabled { background: var(--elevated-2); color: var(--muted); }
+  .send.stop { background: var(--text); color: #111; font-size: 0.8rem; }
+  .disclaimer { text-align: center; margin: 0.45rem 0 0; }
+
+  /* Settings panel */
+  .settings {
+    width: 320px;
+    flex: 0 0 320px;
+    background: var(--sidebar);
+    border-left: 1px solid var(--border);
+    height: 100vh;
+    overflow-y: auto;
+    padding: 0.9rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+  }
+  .settings-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; }
+  .field { display: flex; flex-direction: column; gap: 0.35rem; }
+  .sysprompt { background: var(--elevated); resize: vertical; line-height: 1.45; }
 </style>
