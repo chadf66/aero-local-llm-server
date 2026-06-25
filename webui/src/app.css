@@ -72,6 +72,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0
   padding: 0.1rem 0.34rem;
   border-radius: 5px;
 }
+/* highlight.js: keep our <pre> chrome, let the theme do only the token colors. */
+pre code.hljs { background: transparent; padding: 0; }
 
 .muted { color: var(--muted); }
 .small { font-size: 0.82rem; }
