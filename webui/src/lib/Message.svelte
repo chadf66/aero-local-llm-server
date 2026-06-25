@@ -12,7 +12,13 @@
 
 <div class="row" class:user={isUser}>
   {#if !isUser}
-    <div class="avatar" aria-hidden="true">a</div>
+    <div class="avatar" aria-label="assistant" title="aero">
+      <!-- A sparkle — the common visual shorthand for AI. -->
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+        <path d="M12 2.5l1.9 5.2a4 4 0 0 0 2.4 2.4L21.5 12l-5.2 1.9a4 4 0 0 0-2.4 2.4L12 21.5l-1.9-5.2a4 4 0 0 0-2.4-2.4L2.5 12l5.2-1.9a4 4 0 0 0 2.4-2.4L12 2.5z"/>
+        <path d="M19 3.5l.7 1.8.0 0 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8z" opacity="0.7"/>
+      </svg>
+    </div>
   {/if}
   <div class="content">
     <div class="bubble" class:userbubble={isUser}>
