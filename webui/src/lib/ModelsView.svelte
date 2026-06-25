@@ -181,14 +181,24 @@
                     {#if !m.exists}<span class="badge warn">missing weights</span>{/if}
                   </td>
                   <td class="badges">
-                    {#if m.base}<span class="badge">→ {m.base}</span>{/if}
-                    {#if m.tools}<span class="badge ok">tools</span>{/if}
-                    <span class="badge">{m.kv_cache_type}</span>
-                    <span class="badge">ctx {m.n_ctx}</span>
+                    <div class="badgewrap">
+                      {#if m.base}
+                        <span class="badge kind derived">derived → {m.base}</span>
+                      {:else if m.has_config_file}
+                        <span class="badge kind configured">configured</span>
+                      {:else}
+                        <span class="badge kind raw" title="No models/{m.name}.toml — runs on the serve-time defaults">raw GGUF · defaults</span>
+                      {/if}
+                      {#if m.tools}<span class="badge ok">tools</span>{/if}
+                      <span class="badge">{m.kv_cache_type}</span>
+                      <span class="badge">ctx {m.n_ctx}</span>
+                    </div>
                   </td>
                   <td class="size muted small">{fmtSize(m.size)}</td>
                   <td class="ops">
-                    <button class="small" on:click={() => (editing = m)}>Edit</button>
+                    <button class="small" on:click={() => (editing = m)}>
+                      {m.base == null && !m.has_config_file ? "Configure" : "Edit"}
+                    </button>
                     <button class="small del" on:click={() => remove(m)}>Delete</button>
                   </td>
                 </tr>
@@ -234,10 +244,15 @@
   td { padding: 0.55rem 0.4rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
   tr:last-child td { border-bottom: none; }
   .nm { font-weight: 500; }
-  .badges { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .badgewrap { display: flex; flex-wrap: wrap; gap: 0.3rem; }
   .badge { background: var(--elevated); border-radius: 5px; padding: 0.1rem 0.45rem; font-size: 0.74rem; color: var(--muted); white-space: nowrap; }
   .badge.ok { color: var(--ok); }
   .badge.warn { color: var(--danger); }
+  /* "kind" badge: outlined (not filled) so it reads as a label, not a value chip. */
+  .kind { background: transparent; border: 1px solid var(--border); }
+  .kind.raw { color: var(--muted); border-style: dashed; }
+  .kind.configured { color: var(--text); }
+  .kind.derived { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
   .size { text-align: right; white-space: nowrap; }
   .ops { text-align: right; white-space: nowrap; }
   .ops .del:hover { color: var(--danger); border-color: var(--danger); }

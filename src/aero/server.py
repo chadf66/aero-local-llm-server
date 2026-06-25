@@ -8,6 +8,7 @@ names on demand and keeping at most one resident.
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
@@ -25,6 +26,8 @@ from .schemas import (
     ChatCompletionResponse,
     ChatMessage,
 )
+
+logger = logging.getLogger("aero.server")
 
 app = FastAPI(title="aero")
 
@@ -87,34 +90,42 @@ def chat_completions(request: ChatCompletionRequest):
         )
 
     # Streaming: relay the engine's events as OpenAI chat.completion.chunk frames.
+    # The whole loop is guarded so that *any* failure (including in the end-of-stream
+    # usage tally) still closes the response cleanly with an error frame + [DONE],
+    # rather than resetting the connection — which the browser surfaces as an opaque
+    # "network error" even though the answer already arrived.
     def event_stream():
-        for kind, payload in engine.stream_inference(request):
-            if kind == "delta":
-                yield _sse(
-                    {
-                        "object": "chat.completion.chunk",
-                        "model": request.model,
-                        "choices": [{"index": 0, "delta": payload}],
-                    }
-                )
-            else:  # "end" -> (finish_reason, usage)
-                finish_reason, usage = payload
-                yield _sse(
-                    {
-                        "object": "chat.completion.chunk",
-                        "model": request.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                    }
-                )
-                # OpenAI-style trailing usage chunk (empty choices, usage populated).
-                yield _sse(
-                    {
-                        "object": "chat.completion.chunk",
-                        "model": request.model,
-                        "choices": [],
-                        "usage": usage.model_dump(),
-                    }
-                )
+        try:
+            for kind, payload in engine.stream_inference(request):
+                if kind == "delta":
+                    yield _sse(
+                        {
+                            "object": "chat.completion.chunk",
+                            "model": request.model,
+                            "choices": [{"index": 0, "delta": payload}],
+                        }
+                    )
+                else:  # "end" -> (finish_reason, usage)
+                    finish_reason, usage = payload
+                    yield _sse(
+                        {
+                            "object": "chat.completion.chunk",
+                            "model": request.model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                        }
+                    )
+                    # OpenAI-style trailing usage chunk (empty choices, usage populated).
+                    yield _sse(
+                        {
+                            "object": "chat.completion.chunk",
+                            "model": request.model,
+                            "choices": [],
+                            "usage": usage.model_dump(),
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001 - report, then still close cleanly
+            logger.exception("streaming inference failed for %s", request.model)
+            yield _sse({"error": {"message": str(exc), "type": "server_error"}})
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

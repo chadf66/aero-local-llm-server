@@ -613,6 +613,13 @@ def _stream_usage(handle: Any, request: ChatCompletionRequest, completion_text: 
     if _backend == "stub":
         return _usage(_stub_prompt_tokens(request), len(completion_text.split()))
 
-    completion_tokens = len(handle.tokenize(completion_text.encode("utf-8"), add_bos=False))
-    total_tokens = getattr(handle, "n_tokens", 0) or completion_tokens
-    return _usage(max(0, total_tokens - completion_tokens), completion_tokens)
+    # This runs at the very end of the stream; a failure here must NOT abort the
+    # response before its [DONE] frame (re-tokenizing a long completion has been seen
+    # to raise). Fall back to a whitespace estimate rather than killing the stream.
+    try:
+        completion_tokens = len(handle.tokenize(completion_text.encode("utf-8"), add_bos=False))
+        total_tokens = getattr(handle, "n_tokens", 0) or completion_tokens
+        return _usage(max(0, total_tokens - completion_tokens), completion_tokens)
+    except Exception:  # noqa: BLE001 - usage is best-effort; never break the stream
+        logger.warning("stream usage tally failed; estimating", exc_info=True)
+        return _usage(0, len(completion_text.split()))

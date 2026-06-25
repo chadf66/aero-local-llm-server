@@ -114,7 +114,9 @@ def serve(
     else:
         typer.echo("  web UI:  not built (run `make ui` to enable it)")
 
-    uvicorn.run(server.app, host=host, port=port)
+    # Cap graceful shutdown so Ctrl+C doesn't hang waiting on an open stream — a
+    # single-user local box would rather exit promptly than drain connections.
+    uvicorn.run(server.app, host=host, port=port, timeout_graceful_shutdown=5)
 
 
 # =========================================================================== #

@@ -142,6 +142,7 @@
 
     try {
       for await (const chunk of api.streamChat(body, controller.signal)) {
+        if (chunk.error) { error = chunk.error.message || "server error"; continue; }
         const delta = chunk.choices?.[0]?.delta;
         if (!delta) continue;
         if (delta.content) assistant.content += delta.content;
@@ -155,12 +156,20 @@
         await scrollDown();
       }
     } catch (e) {
-      if (e.name !== "AbortError") error = String(e);
+      // If the answer already arrived, a tail/transport hiccup isn't worth a scary
+      // banner — keep what we got. Only surface errors that lost us the response.
+      const gotAnswer = assistant.content || assistant.tool_calls;
+      if (e.name !== "AbortError" && !gotAnswer) error = String(e);
     } finally {
       generating = false;
       controller = null;
-      await api.addMessage(current.id, assistant);
-      await refreshList();
+      try {
+        if (assistant.content || assistant.tool_calls)
+          await api.addMessage(current.id, assistant);
+        await refreshList();
+      } catch {
+        /* persistence is best-effort; the offline poll will surface a dead server */
+      }
     }
   }
 

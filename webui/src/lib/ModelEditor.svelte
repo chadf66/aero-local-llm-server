@@ -73,7 +73,13 @@
 </script>
 
 <div class="editor">
-  <h3>{editing ? `Edit ${name}` : "New model"}</h3>
+  <h3>{!editing ? "New model" : model.has_config_file ? `Edit ${name}` : `Configure ${name}`}</h3>
+  {#if editing && !model.has_config_file}
+    <p class="small muted hint">
+      This GGUF has no definition yet — it runs on the serve-time defaults. Saving writes
+      its first <code>models/{name}.toml</code>.
+    </p>
+  {/if}
 
   {#if !editing}
     <label class="field">
@@ -156,6 +162,7 @@
     gap: 0.8rem;
   }
   h3 { margin: 0; }
+  .hint { margin: 0; line-height: 1.45; }
   .field { display: flex; flex-direction: column; gap: 0.3rem; }
   .field > span { font-size: 0.85rem; color: var(--muted); }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }
