@@ -13,7 +13,10 @@ MODEL  ?=
 # Port for `make serve`. Default avoids Ollama (11434) and common dev ports.
 PORT   ?= 8317
 
-.PHONY: help install install-metal serve test
+# Where the web UI source lives; `make ui` builds it into the package (src/aero/webui_dist).
+WEBUI  := webui
+
+.PHONY: help install install-metal serve test ui ui-dev
 
 help:            ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -34,3 +37,9 @@ serve:           ## Serve a model: make serve MODEL=/path/to/model.gguf [PORT=83
 
 test:            ## Run the test suite in ./.venv (stub backend, no models needed)
 	$(BIN)/pytest
+
+ui:              ## Build the web UI into the package (needs Node; runtime stays Node-free)
+	cd $(WEBUI) && npm ci && npm run build
+
+ui-dev:          ## Run the Vite dev server (proxies /api and /v1 to a running `aero serve`)
+	cd $(WEBUI) && npm install && npm run dev

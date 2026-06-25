@@ -16,6 +16,7 @@ models (e.g. different system prompts) without copying weights.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 # The aero home. Everything else lives under here.
 DEFAULT_HOME = Path.home() / ".aero"
@@ -29,6 +30,24 @@ def gguf_dir(home: Path) -> Path:
 def config_dir(home: Path) -> Path:
     """Directory of model definitions (`*.toml`)."""
     return home / "models"
+
+
+def db_path(home: Path) -> Path:
+    """SQLite file backing the web UI's conversation history (Phase f)."""
+    return home / "aero.db"
+
+
+def webui_dist() -> Optional[Path]:
+    """The built web-UI assets, or None if the UI hasn't been built.
+
+    The Svelte source lives in the repo's top-level ``webui/``; ``make ui`` (Vite)
+    builds it into ``src/aero/webui_dist/`` so it ships with the package and the
+    server can find it relative to itself — no Node at runtime. Returns None when
+    that directory (or its ``index.html``) is absent, so the server can fall back to
+    a "run `make ui`" hint instead of failing to start.
+    """
+    dist = Path(__file__).parent / "webui_dist"
+    return dist if (dist / "index.html").is_file() else None
 
 
 def human_size(num_bytes: int) -> str:

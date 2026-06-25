@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from pydantic import BaseModel
 
-from . import engine
+from . import db, engine, store
 from .schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -113,3 +115,125 @@ def chat_completions(request: ChatCompletionRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# =========================================================================== #
+# Web-UI API (Phase f). Distinct from the OpenAI surface above: these endpoints
+# serve the bundled UI — live server state, a context-size preview, and durable
+# conversation history (db.py). They are *not* on the inference path: the UI still
+# generates via /v1/chat/completions and posts the resulting turns back here.
+# =========================================================================== #
+
+
+@app.get("/api/state")
+def ui_state() -> dict:
+    """Everything the UI needs to render the model picker + resident badge."""
+    return {"models": engine.model_info(), "loaded": engine.loaded_model()}
+
+
+@app.get("/api/sizing")
+def ui_sizing(model: str, kv_cache_type: str = "f16") -> dict:
+    """Largest context that fits memory for a model at a KV precision (or null)."""
+    return {
+        "model": model,
+        "kv_cache_type": kv_cache_type,
+        "n_ctx": engine.context_preview(model, kv_cache_type),
+    }
+
+
+class ConversationCreate(BaseModel):
+    title: str = "New chat"
+    model: Optional[str] = None
+    system: Optional[str] = None
+
+
+class ConversationPatch(BaseModel):
+    title: Optional[str] = None
+    model: Optional[str] = None
+    system: Optional[str] = None
+
+
+class MessageCreate(BaseModel):
+    role: str
+    content: Optional[str] = None
+    tool_calls: Optional[Any] = None
+
+
+@app.get("/api/conversations")
+def list_conversations(q: Optional[str] = None) -> dict:
+    """List conversations (most-recent first), or search by title/content with ``q``."""
+    rows = db.search(q) if q else db.list_conversations()
+    return {"conversations": rows}
+
+
+@app.post("/api/conversations")
+def create_conversation(body: ConversationCreate) -> dict:
+    return db.create_conversation(body.title, model=body.model, system=body.system)
+
+
+@app.get("/api/conversations/{cid}")
+def get_conversation(cid: str) -> dict:
+    conv = db.get_conversation(cid)
+    if conv is None:
+        raise HTTPException(status_code=404, detail=f"conversation {cid!r} not found")
+    return conv
+
+
+@app.patch("/api/conversations/{cid}")
+def patch_conversation(cid: str, body: ConversationPatch) -> dict:
+    if not db.update_conversation(cid, title=body.title, model=body.model, system=body.system):
+        raise HTTPException(status_code=404, detail=f"conversation {cid!r} not found")
+    return db.get_conversation(cid)
+
+
+@app.delete("/api/conversations/{cid}")
+def delete_conversation(cid: str) -> dict:
+    if not db.delete_conversation(cid):
+        raise HTTPException(status_code=404, detail=f"conversation {cid!r} not found")
+    return {"deleted": cid}
+
+
+@app.post("/api/conversations/{cid}/messages")
+def add_message(cid: str, body: MessageCreate) -> dict:
+    msg = db.add_message(cid, body.role, body.content, tool_calls=body.tool_calls)
+    if msg is None:
+        raise HTTPException(status_code=404, detail=f"conversation {cid!r} not found")
+    return msg
+
+
+@app.delete("/api/conversations/{cid}/messages/last")
+def delete_last_message(cid: str) -> dict:
+    """Drop the latest message — the UI's 'regenerate' deletes the old reply first."""
+    msg = db.delete_last_message(cid)
+    if msg is None:
+        raise HTTPException(status_code=404, detail="no messages to delete")
+    return msg
+
+
+# --------------------------------------------------------------------------- #
+# Static UI. A single catch-all registered LAST so it can't shadow the API routes
+# above (Starlette matches in registration order; the specific /api and /v1 routes
+# win). It resolves the built assets at *request* time via store.webui_dist(): any
+# real file is served directly, anything else falls back to index.html (SPA
+# routing), and if the UI hasn't been built (`make ui`) it returns a short hint.
+# --------------------------------------------------------------------------- #
+
+_UI_HINT = (
+    "<html><body style='font-family:system-ui;max-width:40rem;margin:4rem auto'>"
+    "<h1>aero</h1><p>The web UI isn't built yet. From the repo root run:</p>"
+    "<pre>make ui</pre><p>then reload this page. The API is already live at "
+    "<code>/v1</code> and <code>/api</code>.</p></body></html>"
+)
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def serve_ui(full_path: str):
+    dist = store.webui_dist()
+    if dist is None:
+        return HTMLResponse(_UI_HINT)
+    # Serve a real asset if the path points at one inside dist (guard traversal),
+    # else hand back index.html so the SPA can route the URL itself.
+    candidate = (dist / full_path).resolve()
+    if full_path and dist.resolve() in candidate.parents and candidate.is_file():
+        return FileResponse(candidate)
+    return FileResponse(dist / "index.html")

@@ -7,8 +7,8 @@ no Docker, no router/worker split, no auth, memory-first (~16 GB unified memory 
 the tight case). Choices that are right for a multi-client online server are often
 wrong here, and where they differ this doc says so.
 
-Phases a–c are **implemented** (the MVP). Phases d–f are the roadmap, recorded here
-so the work isn't lost.
+Phases a–e and **f1** are **implemented**. Phase **f2** (model management from the
+UI) is the remaining roadmap item, recorded here so the work isn't lost.
 
 ---
 
@@ -164,35 +164,56 @@ model with `tools = true`.
 Future: other tool-call formats (e.g. Llama-3.1's `<|python_tag|>`), `parallel_tool_calls`,
 and grammar-constrained forcing.
 
-## Phase f — Web chat UI
+## Phase f — Web UI
 
 A web UI that beats the typical local experience (Open WebUI is the bar) by showing
-off what the engine and models actually do — served by the same FastAPI app.
+off what the engine and models actually do — served by the same FastAPI app. Split
+into **f1** (chat + history + knobs, **done**) and **f2** (model management from the
+UI, the roadmap below).
 
-- **Stack:** a modern SPA (Svelte/React via Vite; framework TBD), built to static
-  assets and mounted by FastAPI at `/`. **Node is a build-time-only dependency** — the
-  runtime stays one `aero serve`, no Node. (Decide later: commit built assets vs build
-  on install.)
-- **Persistence:** server-side SQLite at `~/.aero/aero.db` for **searchable, durable
-  history** (conversations + messages + tool calls) — a concrete "better than Ollama"
-  win. New conversation-CRUD endpoints; this is the *only* server state, and it's kept
-  off the inference path.
-- **Showcase features:** model picker + **live resident-model state** (load / evict /
-  idle-unload, which the engine already tracks); streaming with stop/regenerate;
-  collapsible **`<think>`** blocks for reasoning models; inline **tool-call cards**
-  (the model requested `f(args)`, here's the result); per-conversation system prompt +
-  sampling controls wired to Modelfile defaults; markdown + code highlighting.
-- **Surface the memory knobs, not just sampling.** Alongside temperature / top_p /
-  top_k, expose **`n_ctx` (incl. `auto`)** and **`kv_cache_type` (f16/q8_0/q4_0)** as
-  first-class controls, with a short inline explainer. These are what make bigger
-  open models *feasible* on a constrained Mac, yet they're obscure even to
-  experienced practitioners — surfacing + explaining them in the UI is a genuine
-  differentiator and a teaching moment. Show the trade live: changing `kv_cache_type`
-  should display the resulting max context (we already compute it in `sizing.py`), so
-  the f16→q8_0→q4_0 context gain is visible. Stretch: separate **K vs V** cache
-  precision (K is more sensitive; llama.cpp supports distinct `type_k`/`type_v`, which
-  the engine currently sets equal) — the highest-leverage quality knob when leaning on
-  `q4_0`.
+**Stack (both):** a Svelte + Vite SPA, built to static assets and served by FastAPI
+via a request-time catch-all (`store.webui_dist()` → `src/aero/webui_dist/`). **Node is
+build-time only** — once `make ui` runs, the runtime stays one `aero serve`, no Node.
+The build output is generated, so it's gitignored rather than committed.
+
+### Phase f1 — Chat UI + history + knobs (done)
+
+- **Persistence — done.** Server-side SQLite at `~/.aero/aero.db` (`db.py`) for
+  **searchable, durable history** (conversations + messages + tool calls). Conversation
+  CRUD + message + search endpoints under `/api/...`. This is the *only* server state
+  and it's kept **off the inference path**: the UI generates via `/v1/chat/completions`
+  exactly as an agent would, then posts the resulting turns back to the history API.
+- **Showcase features — done.** Model picker + **live resident-model badge** (polls
+  `/api/state`, which the engine already tracks); streaming with **stop / regenerate**;
+  collapsible **`<think>`** blocks for reasoning models; inline **tool-call cards**;
+  per-conversation system prompt + sampling controls; markdown + code highlighting.
+- **Memory knobs surfaced — done.** Alongside temperature / top_p / top_k, the UI
+  explains **`kv_cache_type` (f16/q8_0/q4_0)** and shows the **resulting max context
+  live** via `/api/sizing` (reusing `sizing.compute_fit`), so the f16→q8_0→q4_0 context
+  gain is visible. These levers are what make bigger models *feasible* on a constrained
+  Mac yet are obscure even to practitioners — surfacing + explaining them is the
+  teaching moment. (`kv_cache_type`/`n_ctx` are load-time model settings, not per-request
+  fields, so the UI presents them as an explained preview; *changing* them is f2's config
+  editor. Stretch, still open: separate **K vs V** precision — the engine sets `type_k`/
+  `type_v` equal today.)
+
+### Phase f2 — Model management from the UI (next)
+
+Make aero configurable from the browser, reusing the CLI's existing logic
+(`cli.py`'s `pull`/`rm`/`_STARTER_TEMPLATE`, `config.ModelConfig`).
+
+- **Admin API** (`/api/models …`): list a repo's GGUF quants + **pull with live
+  progress** (SSE), create/edit a `.toml` definition from a validated form (round-trips
+  through `ModelConfig`), and delete (mirroring `aero rm`'s orphan-safety).
+- **Live registry reload:** `engine.reload(registry)` that refreshes the model set under
+  the lock **without** dropping a still-valid resident model (today `configure()` always
+  `_unload()`s) — so a pull/create/edit/delete takes effect with no server restart.
+- **Management UI:** a "Models" view — browse/pull, a config editor surfacing the same
+  knobs (system, n_ctx/auto, kv_cache_type, sampling, tools, derived `from`) with the
+  live `/api/sizing` preview, and delete with guardrails.
+
+### Phase f — still open (either f2 or a follow-up)
+
 - **Conversation compaction (summarize & truncate):** long chats overflow `n_ctx`
   (today `aero run` re-sends the full transcript with no windowing — see `_stream_chat`
   in `cli.py`). When the prompt nears the context budget, summarize the oldest turns

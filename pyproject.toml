@@ -27,6 +27,11 @@ dev = [
     "pytest>=8",
     "httpx>=0.27",  # FastAPI's TestClient needs httpx
 ]
+# Web UI (Phase f) needs no extra Python deps: FastAPI/uvicorn are already required
+# and the conversation store is stdlib sqlite3. The SPA is built with Node, a
+# *build-time-only* tool (`make ui`) — never needed at runtime. This extra is left
+# empty as a documented placeholder for any future web-only Python dependency.
+web = []
 # Clients used by the tool-calling examples (examples/). Not needed to run aero.
 examples = [
     "openai>=1.40",
