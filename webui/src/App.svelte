@@ -5,14 +5,17 @@
   import Message from "./lib/Message.svelte";
   import Knobs from "./lib/Knobs.svelte";
 
+  const emptyChat = () => ({ id: null, title: "New chat", model: "", system: "", messages: [] });
+
   let serverState = { models: [], loaded: null };
   let conversations = [];
-  let current = null; // { id, title, model, system, messages: [] }
+  let current = emptyChat(); // always a valid chat object (never null) so the first render is safe
   let model = "";
   let input = "";
   let generating = false;
   let controller = null;
   let error = "";
+  let offline = false; // true once a backend request fails (proxy/`aero serve` not reachable)
   let scroller;
 
   let knobs = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: null };
@@ -32,7 +35,6 @@
     await refreshState();
     await refreshList();
     statePoll = setInterval(refreshState, 3000);
-    if (!model && serverState.models.length) model = serverState.models[0].name;
     newChat();
   });
   onDestroy(() => clearInterval(statePoll));
@@ -40,17 +42,22 @@
   async function refreshState() {
     try {
       serverState = await api.getState();
+      offline = false;
       if (!model && serverState.models.length) model = serverState.models[0].name;
     } catch (e) {
-      error = String(e);
+      offline = true; // backend unreachable — keep the UI usable and say so
     }
   }
   async function refreshList(q) {
-    conversations = (await api.listConversations(q)).conversations;
+    try {
+      conversations = (await api.listConversations(q)).conversations;
+    } catch (e) {
+      offline = true;
+    }
   }
 
   function newChat() {
-    current = { id: null, title: "New chat", model, system: "", messages: [] };
+    current = { ...emptyChat(), model };
   }
 
   async function openChat(id) {
@@ -202,16 +209,37 @@
         class="sysprompt"
         placeholder="System prompt (optional)…"
         bind:value={current.system}
-        disabled={generating || (current && current.id != null && current.messages.length > 0)}
+        disabled={generating || (current.id != null && current.messages.length > 0)}
       />
     </header>
 
     <div class="scroll" bind:this={scroller}>
-      {#if current}
-        {#each current.messages.filter((m) => m.role !== "tool") as m (m)}
-          <Message message={m} {toolResults} />
-        {/each}
+      {#if offline}
+        <div class="notice">
+          <strong>Can't reach the aero server.</strong>
+          <p class="small muted">
+            Start it in another terminal with <code>aero serve</code> (it listens on
+            <code>:8317</code>). In dev mode the Vite server proxies <code>/api</code> and
+            <code>/v1</code> there.
+          </p>
+        </div>
+      {:else if serverState.models.length === 0}
+        <div class="notice">
+          <strong>No models available.</strong>
+          <p class="small muted">
+            Pull one with <code>aero pull &lt;repo&gt;</code>, then restart
+            <code>aero serve</code>.
+          </p>
+        </div>
+      {:else if current.messages.length === 0}
+        <div class="notice muted">
+          <p>Chatting with <strong>{model}</strong>. Ask anything below.</p>
+        </div>
       {/if}
+
+      {#each current.messages.filter((m) => m.role !== "tool") as m (m)}
+        <Message message={m} {toolResults} />
+      {/each}
       {#if error}<div class="error small">{error}</div>{/if}
     </div>
 
@@ -226,9 +254,9 @@
         placeholder="Message {model || "—"}…  (Enter to send, Shift+Enter for newline)"
         bind:value={input}
         on:keydown={onKey}
-        disabled={generating}
+        disabled={generating || !model}
       ></textarea>
-      <button class="primary" on:click={send} disabled={generating || !input.trim()}>Send</button>
+      <button class="primary" on:click={send} disabled={generating || !input.trim() || !model}>Send</button>
     </footer>
   </main>
 
@@ -258,6 +286,16 @@
   }
   .dot.ok { background: var(--ok); }
   .scroll { flex: 1; overflow-y: auto; padding: 1rem 1.2rem; }
+  .notice {
+    max-width: 40rem;
+    margin: 2rem auto;
+    text-align: center;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.2rem 1.4rem;
+    background: var(--panel);
+  }
+  .notice p { line-height: 1.5; }
   .error {
     color: var(--danger);
     border: 1px solid var(--danger);
