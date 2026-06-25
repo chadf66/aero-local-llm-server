@@ -8,14 +8,17 @@ names on demand and keeping at most one resident.
 from __future__ import annotations
 
 import json
+import queue
+import threading
 import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, Union
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
-from . import db, engine, store
+from . import db, engine, store, store_ops
 from .schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -208,6 +211,173 @@ def delete_last_message(cid: str) -> dict:
     if msg is None:
         raise HTTPException(status_code=404, detail="no messages to delete")
     return msg
+
+
+# =========================================================================== #
+# Model management (Phase f2). Pull from Hugging Face, create/edit/delete model
+# configs — all reusing store_ops (the same logic the CLI uses) and applying live
+# via engine.reload_from_disk(), so changes take effect with no server restart.
+# =========================================================================== #
+
+# Only one download at a time on a single-user box.
+_pull_active = threading.Lock()
+
+
+def _require_home() -> Path:
+    home = engine.home()
+    if home is None:
+        raise HTTPException(status_code=503, detail="model management requires `aero serve`")
+    return home
+
+
+def _model_detail(name: str, cfg, registry: dict) -> dict:
+    p = Path(cfg.path)
+    home = engine.home()
+    toml_path = (store.config_dir(home) / f"{name}.toml") if home else None
+    return {
+        "name": name,
+        "base": cfg.base,
+        "path": cfg.path,
+        "size": p.stat().st_size if p.is_file() else None,
+        "exists": p.is_file(),
+        "n_ctx": cfg.n_ctx,
+        "kv_cache_type": cfg.kv_cache_type,
+        "max_tokens": cfg.max_tokens,
+        "tools": engine.supports_tools(name),
+        "chat_format": cfg.chat_format,
+        "system": cfg.system,
+        "sampling": cfg.sampling.model_dump(exclude_none=True),
+        "has_config_file": bool(toml_path and toml_path.is_file()),
+        "referenced_by": sorted(n for n, c in registry.items() if n != name and c.path == cfg.path),
+    }
+
+
+@app.get("/api/models")
+def list_installed_models() -> dict:
+    """Installed models with size, base, config fields, and reference info (for delete)."""
+    registry = engine.current_models()
+    return {"models": [_model_detail(n, c, registry) for n, c in sorted(registry.items())]}
+
+
+@app.get("/api/models/repo")
+def list_repo_models(repo: str) -> dict:
+    """The GGUF quants available in a Hugging Face repo (for the pull picker)."""
+    try:
+        return {"repo": repo, "files": store_ops.list_repo_ggufs(repo)}
+    except Exception as exc:  # noqa: BLE001 - surface HF errors as a clean 400
+        raise HTTPException(status_code=400, detail=f"could not list {repo!r}: {exc}")
+
+
+@app.get("/api/models/pull")
+def pull_model(repo: str, filename: str):
+    """Stream a GGUF download as SSE progress, then register it and reload (no restart)."""
+    home = _require_home()
+    if not _pull_active.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a download is already in progress")
+
+    def event_stream():
+        events: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                store_ops.download_gguf(
+                    repo, filename, store.gguf_dir(home),
+                    progress_cb=lambda d, t: events.put(("progress", (d, t))),
+                )
+                stem = Path(filename).stem
+                store_ops.write_starter_config(home, stem)
+                engine.reload_from_disk()
+                events.put(("done", {"name": stem}))
+            except Exception as exc:  # noqa: BLE001 - report to the client, don't crash
+                events.put(("error", str(exc)))
+            finally:
+                events.put(("__end__", None))
+
+        threading.Thread(target=worker, name="aero-pull", daemon=True).start()
+        last = 0.0
+        try:
+            while True:
+                kind, payload = events.get()
+                if kind == "__end__":
+                    break
+                if kind == "progress":
+                    d, t = payload
+                    now = time.monotonic()
+                    if now - last >= 0.3 or (t and d >= t):  # throttle to ~3/sec
+                        last = now
+                        yield _sse({"type": "progress", "downloaded": d, "total": t,
+                                    "pct": round(d / t * 100, 1) if t else None})
+                elif kind == "done":
+                    yield _sse({"type": "done", **payload})
+                elif kind == "error":
+                    yield _sse({"type": "error", "detail": payload})
+            yield "data: [DONE]\n\n"
+        finally:
+            _pull_active.release()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+class ModelConfigBody(BaseModel):
+    """Editable config fields (mirrors the `.toml`). All optional; unset = use defaults."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: Optional[str] = None                       # required for create (POST)
+    base: Optional[str] = Field(default=None, alias="from")
+    system: Optional[str] = None
+    n_ctx: Optional[Union[int, str]] = None          # int or "auto"
+    kv_cache_type: Optional[str] = None
+    max_tokens: Optional[int] = None
+    tools: Optional[bool] = None
+    chat_format: Optional[str] = None
+    sampling: Optional[dict] = None
+
+
+def _fields(body: ModelConfigBody) -> dict:
+    f: dict = {}
+    if body.base is not None:
+        f["from"] = body.base
+    for k in ("system", "n_ctx", "kv_cache_type", "max_tokens", "tools", "chat_format"):
+        v = getattr(body, k)
+        if v is not None:
+            f[k] = v
+    if body.sampling:
+        f["sampling"] = body.sampling
+    return f
+
+
+def _save_model(home: Path, name: str, body: ModelConfigBody) -> dict:
+    try:
+        store_ops.write_model_config(home, name, _fields(body))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    models = engine.reload_from_disk()
+    return {"name": store_ops.sanitize_name(name), "models": models}
+
+
+@app.post("/api/models")
+def create_model(body: ModelConfigBody) -> dict:
+    home = _require_home()
+    if not body.name:
+        raise HTTPException(status_code=400, detail="`name` is required to create a model")
+    return _save_model(home, body.name, body)
+
+
+@app.put("/api/models/{name}")
+def edit_model(name: str, body: ModelConfigBody) -> dict:
+    home = _require_home()
+    return _save_model(home, name, body)
+
+
+@app.delete("/api/models/{name}")
+def remove_model(name: str, weights: bool = False) -> dict:
+    home = _require_home()
+    try:
+        result = store_ops.delete_model(home, name, engine.current_models(), weights=weights)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    result["models"] = engine.reload_from_disk()
+    return result
 
 
 # --------------------------------------------------------------------------- #

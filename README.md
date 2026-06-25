@@ -8,10 +8,11 @@ on a memory-constrained MacBook Air. Unlike a fleet server, **the Mac itself is 
 product** — a single process on localhost, single user, one model resident at a
 time, inference on the Metal GPU. No Docker, no router/worker split, no auth.
 
-> **Status:** Phase f1 done. MVP plus per-model config, config/weights decoupling
-> (one GGUF, many models), memory-aware auto context sizing, **tool calling** for
-> agent harnesses, and a **web chat UI** with searchable history. See
-> [PHASES.md](PHASES.md) — model management from the UI (f2) is next.
+> **Status:** Phase f2 done — the roadmap is complete. MVP plus per-model config,
+> config/weights decoupling (one GGUF, many models), memory-aware auto context sizing,
+> **tool calling** for agent harnesses, and a **web UI** with searchable history *and*
+> full **model management** (pull, create/edit configs, delete — applied live, no
+> restart). See [PHASES.md](PHASES.md).
 
 ## Install
 
@@ -50,6 +51,13 @@ It streams responses, collapses `<think>` reasoning blocks, renders tool-call ca
 keeps **searchable conversation history** (SQLite at `~/.aero/aero.db`), and surfaces
 the **memory knobs** (`kv_cache_type` and the resulting max context) with an inline
 explainer — the levers that make bigger models fit on a constrained Mac.
+
+**Manage models** (the sidebar button) is the same store, in the browser: pull a GGUF
+from Hugging Face with a live progress bar, create/edit a model's config from a form
+(system prompt, `n_ctx`/`auto`, `kv_cache_type`, sampling, tools, derived `from`), and
+delete models. Changes apply **live** — the server reloads its model set with no
+restart, keeping the resident model loaded if it's unaffected. It's the same
+`store_ops` code path as the `aero pull`/`rm` CLI, so the two never drift.
 
 The UI is a Svelte SPA built to static assets and served by FastAPI. **Node is a
 build-time-only tool** — once built, the runtime is still just `aero serve`, no Node.

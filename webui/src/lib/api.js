@@ -44,6 +44,59 @@ export const addMessage = (id, msg) =>
 export const deleteLastMessage = (id) =>
   fetch(`/api/conversations/${id}/messages/last`, { method: "DELETE" }).then(json);
 
+// --- model management (Phase f2) ------------------------------------------
+export const listInstalledModels = () => fetch("/api/models").then(json);
+export const listRepoModels = (repo) =>
+  fetch(`/api/models/repo?repo=${encodeURIComponent(repo)}`).then(json);
+export const createModel = (body) =>
+  fetch("/api/models", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(json);
+export const editModel = (name, body) =>
+  fetch(`/api/models/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(json);
+export const deleteModel = (name, weights = false) =>
+  fetch(`/api/models/${encodeURIComponent(name)}?weights=${weights}`, {
+    method: "DELETE",
+  }).then(json);
+
+// Stream a pull's SSE progress. `onEvent` gets each parsed frame
+// ({type:"progress"|"done"|"error", ...}); resolves when the stream ends.
+export async function pullModel(repo, filename, onEvent, signal) {
+  const url = `/api/models/pull?repo=${encodeURIComponent(repo)}&filename=${encodeURIComponent(filename)}`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${detail}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data: ")) continue;
+      const data = t.slice(6);
+      if (data === "[DONE]") return;
+      try {
+        onEvent(JSON.parse(data));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 // --- streaming chat over /v1/chat/completions -----------------------------
 // Yields parsed OpenAI chunk objects. `signal` lets the caller stop generation.
 export async function* streamChat(body, signal) {

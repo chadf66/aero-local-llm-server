@@ -48,6 +48,12 @@ _backend = "llama"
 _idle_timeout = 300.0                  # seconds; 0 disables idle-unload
 _mem_fraction = 0.70                   # fraction of total memory for `n_ctx = "auto"`
 
+# Registry-build context, remembered so the engine can rebuild the model set from
+# disk after the admin API pulls/edits/deletes a model (reload_from_disk). None when
+# serving an ad-hoc set (e.g. tests, or `serve --model <file>` only).
+_home = None                           # type: Optional[object]  (pathlib.Path)
+_registry_defaults: dict = {}          # {"default_n_ctx", "default_kv_cache_type"}
+
 # The one resident model, guarded by _lock. _handle is a llama_cpp.Llama (or the
 # name string for the stub backend). All loads, unloads, inference, and the idle
 # sweep serialize on _lock -- correct and simple for a single-user box.
@@ -68,16 +74,66 @@ def configure(
     backend: str = "llama",
     idle_timeout: float = 300.0,
     mem_fraction: float = 0.70,
+    home=None,
+    registry_defaults: Optional[dict] = None,
 ) -> None:
-    """Install the per-model configs and load policy. Nothing is loaded yet."""
-    global _models, _backend, _idle_timeout, _mem_fraction
+    """Install the per-model configs and load policy. Nothing is loaded yet.
+
+    ``home`` + ``registry_defaults`` (the ``default_n_ctx`` / ``default_kv_cache_type``
+    passed to ``config.build_registry``) are remembered so ``reload_from_disk`` can
+    rebuild the same registry after the model store changes on disk.
+    """
+    global _models, _backend, _idle_timeout, _mem_fraction, _home, _registry_defaults
     with _lock:
         _unload()  # drop any model loaded under the previous config
         _models = dict(models)
         _backend = backend
         _idle_timeout = float(idle_timeout)
         _mem_fraction = float(mem_fraction)
+        _home = home
+        _registry_defaults = dict(registry_defaults or {})
     _start_idle_thread()
+
+
+def reload(models: dict[str, ModelConfig]) -> None:
+    """Swap in a new model set, keeping the resident model loaded if still valid.
+
+    Unlike ``configure``, this does *not* unconditionally unload: if the currently
+    resident model is still present with the same ``load_key`` (weights/ctx/kv/format),
+    its loaded llama context is preserved — so editing an *unrelated* model, or pulling
+    a new one, doesn't evict what you're using. Only a resident that vanished or whose
+    load-affecting config changed is unloaded (its next request reloads it cold).
+    """
+    global _models
+    with _lock:
+        keep = _loaded_name in models and _loaded_key == models[_loaded_name].load_key()
+        if _loaded_name is not None and not keep:
+            _unload()
+        _models = dict(models)
+
+
+def reload_from_disk() -> list[dict]:
+    """Rebuild the registry from ``home`` and reload. Returns the new ``model_info()``.
+
+    Called by the admin API after a pull/create/edit/delete so the served model set
+    refreshes with no restart. Raises if the engine wasn't configured with a ``home``.
+    """
+    if _home is None:
+        raise RuntimeError("engine has no home; model management requires `aero serve`")
+    from . import config, store
+
+    registry = config.build_registry(
+        store.gguf_dir(_home), store.config_dir(_home),
+        default_n_ctx=_registry_defaults.get("default_n_ctx", 4096),
+        default_kv_cache_type=_registry_defaults.get("default_kv_cache_type", "f16"),
+    )
+    reload(registry)
+    return model_info()
+
+
+def home():
+    """The configured aero home (a pathlib.Path), or None."""
+    return _home
 
 
 def available_models() -> list[str]:
@@ -105,6 +161,16 @@ def model_info() -> list[dict]:
             "system": cfg.system,
         })
     return info
+
+
+def get_config(name: str) -> Optional[ModelConfig]:
+    """The full ModelConfig for ``name`` (for the admin config editor), or None."""
+    return _models.get(name)
+
+
+def current_models() -> dict[str, ModelConfig]:
+    """A snapshot copy of the registry (name -> ModelConfig)."""
+    return dict(_models)
 
 
 def context_preview(name: str, kv_cache_type: str) -> Optional[int]:
