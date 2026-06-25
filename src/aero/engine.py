@@ -90,6 +90,47 @@ def loaded_model() -> Optional[str]:
     return _loaded_name
 
 
+def model_info() -> list[dict]:
+    """Per-model config detail for the web UI's `/api/state` (one dict per model)."""
+    info = []
+    for name in sorted(_models):
+        cfg = _models[name]
+        info.append({
+            "name": name,
+            "base": cfg.base,
+            "n_ctx": cfg.n_ctx,
+            "kv_cache_type": cfg.kv_cache_type,
+            "max_tokens": cfg.max_tokens,
+            "tools": supports_tools(name),
+            "system": cfg.system,
+        })
+    return info
+
+
+def context_preview(name: str, kv_cache_type: str) -> Optional[int]:
+    """Largest context that fits memory for ``name`` at ``kv_cache_type``.
+
+    Powers the UI's live f16→q8_0→q4_0 trade display. Returns None when it can't be
+    computed (unknown model, missing weights, or the stub backend has no GGUF to
+    read dimensions from) so the endpoint can degrade gracefully.
+    """
+    cfg = _models.get(name)
+    if cfg is None or kv_cache_type not in KV_CACHE_TYPES:
+        return None
+    try:
+        import os
+
+        from . import sizing
+
+        dims = sizing.read_gguf_dims(cfg.path)
+        budget = int(sizing.total_memory_bytes() * _mem_fraction)
+        n_ctx = sizing.compute_fit(dims, os.path.getsize(cfg.path), kv_cache_type, budget)
+        return n_ctx or None
+    except Exception:  # noqa: BLE001 - preview is best-effort; never fail the request
+        logger.debug("context_preview failed for %s", name, exc_info=True)
+        return None
+
+
 # llama.cpp chat handlers that parse tool calls themselves (if one is set explicitly).
 _TOOL_CHAT_FORMATS = {"chatml-function-calling", "functionary", "functionary-v1", "functionary-v2"}
 

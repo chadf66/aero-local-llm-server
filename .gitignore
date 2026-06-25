@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# aero web UI (Phase f): Node deps and the Vite build output. The build is
+# produced by `make ui` into the package; it's generated, so we don't commit it.
+webui/node_modules/
+src/aero/webui_dist/

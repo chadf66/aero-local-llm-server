@@ -95,7 +95,7 @@ def serve(
     # Imported here so other commands (and `--help`) don't pull in the heavy engine.
     import uvicorn
 
-    from . import engine, server
+    from . import db, engine, server
 
     if kv_cache_type not in config.KV_CACHE_TYPES:
         raise typer.BadParameter(f"--kv-cache-type must be one of {', '.join(config.KV_CACHE_TYPES)}")
@@ -123,11 +123,16 @@ def serve(
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     engine.configure(registry, backend="llama", idle_timeout=idle_timeout, mem_fraction=mem_fraction)
+    db.connect(home)  # web-UI conversation history (off the inference path)
 
     typer.echo(f"Serving {len(registry)} model(s) on http://{host}:{port}  (base_url: http://{host}:{port}/v1)")
     typer.echo(f"  models: {', '.join(sorted(registry))}")
     typer.echo(f"  load-on-demand, one resident; defaults n_ctx={n_ctx}, kv={kv_cache_type}, "
                f"idle_timeout={idle_timeout}s (per-model config overrides apply)")
+    if store.webui_dist() is not None:
+        typer.echo(f"  web UI:  http://{host}:{port}/")
+    else:
+        typer.echo("  web UI:  not built (run `make ui` to enable it)")
 
     uvicorn.run(server.app, host=host, port=port)
 
