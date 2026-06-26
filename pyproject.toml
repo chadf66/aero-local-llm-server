@@ -32,6 +32,12 @@ dev = [
 # *build-time-only* tool (`make ui`) — never needed at runtime. This extra is left
 # empty as a documented placeholder for any future web-only Python dependency.
 web = []
+# Local RAG / knowledge bases (Phase g): the on-disk vector store and document
+# parsing. Embeddings themselves come from the llama backend (the `llama` extra).
+rag = [
+    "lancedb>=0.10",   # embedded, disk-native vector store (no server)
+    "pypdf>=4",        # PDF text extraction
+]
 # Clients used by the tool-calling examples (examples/). Not needed to run aero.
 examples = [
     "openai>=1.40",

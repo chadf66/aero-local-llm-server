@@ -26,10 +26,10 @@ $(VENV):
 	$(PYTHON) -m venv $(VENV)
 
 install: $(VENV)     ## Install deps into ./.venv, CPU only (enough for tests/stub)
-	$(BIN)/pip install -e ".[dev]"
+	$(BIN)/pip install -e ".[dev,rag]"
 
 install-metal: $(VENV)  ## Install deps into ./.venv with the Metal backend (Apple Silicon)
-	CMAKE_ARGS="-DGGML_METAL=on" $(BIN)/pip install -e ".[llama,dev]"
+	CMAKE_ARGS="-DGGML_METAL=on" $(BIN)/pip install -e ".[llama,dev,rag]"
 
 serve:           ## Serve a model: make serve MODEL=/path/to/model.gguf [PORT=8317]
 	@test -n "$(MODEL)" || { echo ">> set MODEL=/path/to/model.gguf"; exit 1; }

@@ -38,6 +38,16 @@ def embedders_dir(home: Path) -> Path:
     return home / "embedders"
 
 
+def knowledge_dir(home: Path) -> Path:
+    """Directory of named knowledge bases (RAG). Each subdir is one KB."""
+    return home / "knowledge"
+
+
+def kb_dir(home: Path, name: str) -> Path:
+    """One knowledge base's directory (holds sources/, the vector index, and kb.json)."""
+    return knowledge_dir(home) / name
+
+
 def db_path(home: Path) -> Path:
     """SQLite file backing the web UI's conversation history (Phase f)."""
     return home / "aero.db"
