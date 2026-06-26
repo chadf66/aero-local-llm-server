@@ -254,6 +254,114 @@ def rm(
 
 
 # =========================================================================== #
+# kb — knowledge bases (RAG)
+# =========================================================================== #
+
+kb_app = typer.Typer(help="Manage knowledge bases (RAG).", no_args_is_help=True)
+app.add_typer(kb_app, name="kb")
+
+
+def _engine_for_embedding(home: Path) -> None:
+    """Configure the engine (real backend) so embedding works for CLI kb commands."""
+    from . import engine
+    engine.configure({}, backend="llama", idle_timeout=0, home=home)
+
+
+@kb_app.command("create")
+def kb_create(
+    name: str = typer.Argument(..., help="Knowledge base name."),
+    embedder: str = typer.Option(..., "--embedder", "-e", help="Embedding model (in embedders/)."),
+    home: Path = _home_opt,
+    chunk_size: int = typer.Option(1200, "--chunk-size", help="Chunk size in characters."),
+    overlap: int = typer.Option(150, "--overlap", help="Chunk overlap in characters."),
+) -> None:
+    """Create an empty knowledge base bound to an embedding model."""
+    from . import rag
+    _engine_for_embedding(home)
+    try:
+        m = rag.create_kb(home, name, embedder, chunk_size=chunk_size, overlap=overlap)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc))
+    typer.echo(f"Created knowledge base {m['name']!r}  (embedder={m['embedder']}, dim={m['dim']})")
+    typer.echo(f"  add files with:  aero kb add {m['name']} <path> ...")
+
+
+@kb_app.command("add")
+def kb_add(
+    name: str = typer.Argument(..., help="Knowledge base name."),
+    paths: list[Path] = typer.Argument(..., help="Files or directories to ingest."),
+    home: Path = _home_opt,
+) -> None:
+    """Ingest files/directories into a knowledge base (incremental; skips unchanged)."""
+    from . import rag
+    if not rag.kb_exists(home, name):
+        raise typer.BadParameter(f"no knowledge base named {name!r} (create it first)")
+    _engine_for_embedding(home)
+
+    def progress(i: int, total: int, source: str, status: str) -> None:
+        typer.echo(f"  [{i}/{total}] {status:<8} {source}")
+
+    try:
+        result = rag.ingest(home, name, paths, progress_cb=progress)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc))
+    typer.echo(f"Ingested {result['files_ingested']} file(s), {result['chunks_added']} chunk(s); "
+               f"{result['skipped']} skipped. KB now holds {result['total_files']} file(s).")
+
+
+@kb_app.command("list")
+def kb_list(home: Path = _home_opt) -> None:
+    """List knowledge bases."""
+    from . import rag
+    kbs = rag.list_kbs(home)
+    if not kbs:
+        typer.echo(f"No knowledge bases in {home}. Create one with `aero kb create`.")
+        return
+    width = max(len(k["name"]) for k in kbs)
+    for k in kbs:
+        typer.echo(f"{k['name']:<{width}}  {k['files']:>3} files  {k['chunks']:>5} chunks  "
+                   f"(embedder={k['embedder']}, dim={k['dim']})")
+
+
+@kb_app.command("rm")
+def kb_rm(
+    name: str = typer.Argument(..., help="Knowledge base name."),
+    home: Path = _home_opt,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Delete without confirmation."),
+) -> None:
+    """Delete a knowledge base (sources, index, and manifest)."""
+    from . import rag
+    if not rag.kb_exists(home, name):
+        raise typer.BadParameter(f"no knowledge base named {name!r}")
+    if not yes:
+        typer.confirm(f"Delete knowledge base {name!r} and all its data?", abort=True)
+    rag.delete_kb(home, name)
+    typer.echo(f"Removed knowledge base {name}")
+
+
+@kb_app.command("search")
+def kb_search(
+    name: str = typer.Argument(..., help="Knowledge base name."),
+    query: str = typer.Argument(..., help="Query text."),
+    home: Path = _home_opt,
+    k: int = typer.Option(4, "-k", help="Number of chunks to return."),
+) -> None:
+    """Search a knowledge base (debugging aid; prints the top chunks)."""
+    from . import rag
+    if not rag.kb_exists(home, name):
+        raise typer.BadParameter(f"no knowledge base named {name!r}")
+    _engine_for_embedding(home)
+    hits = rag.search(home, name, query, k=k)
+    if not hits:
+        typer.echo("(no results — is the KB empty?)")
+        return
+    for i, h in enumerate(hits, start=1):
+        preview = " ".join(h["text"].split())[:160]
+        typer.echo(f"{i}. [{h['score']:.3f}] {h['source']} (chars {h['start']}-{h['end']})")
+        typer.echo(f"     {preview}…")
+
+
+# =========================================================================== #
 # run — interactive chat (auto-starts a server if needed)
 # =========================================================================== #
 
