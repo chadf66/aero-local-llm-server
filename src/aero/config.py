@@ -51,6 +51,8 @@ class ModelConfig(BaseModel):
     max_tokens: Optional[int] = None        # default completion cap
     chat_format: Optional[str] = None       # llama.cpp chat_format override (e.g. "chatml")
     tools: bool = False                     # enable tool calling (chatml-function-calling)
+    knowledge: Optional[str] = None         # knowledge base to ground answers in (RAG)
+    knowledge_top_k: int = 4                # how many retrieved chunks to inject
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
 
     @field_validator("kv_cache_type")
@@ -117,6 +119,8 @@ def load_config_file(
         max_tokens=data.get("max_tokens"),
         chat_format=data.get("chat_format"),
         tools=data.get("tools", False),
+        knowledge=data.get("knowledge"),
+        knowledge_top_k=data.get("knowledge_top_k", 4),
         sampling=SamplingConfig(**data.get("sampling", {})),
     )
 

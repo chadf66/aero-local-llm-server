@@ -62,7 +62,8 @@ def write_starter_config(home: Path, stem: str) -> Path:
     return toml_path
 
 # Field order for the generated .toml (only set fields are emitted).
-_TOP_FIELDS = ("from", "system", "n_ctx", "kv_cache_type", "max_tokens", "tools", "chat_format")
+_TOP_FIELDS = ("from", "system", "n_ctx", "kv_cache_type", "max_tokens", "tools",
+               "chat_format", "knowledge", "knowledge_top_k")
 _SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "stop")
 
 
@@ -209,6 +210,8 @@ def write_model_config(home: Path, name: str, fields: dict) -> Path:
         max_tokens=fields.get("max_tokens"),
         chat_format=fields.get("chat_format"),
         tools=bool(fields.get("tools", False)),
+        knowledge=fields.get("knowledge"),
+        knowledge_top_k=fields.get("knowledge_top_k", 4),
         sampling=SamplingConfig(**(fields.get("sampling") or {})),
     )
 

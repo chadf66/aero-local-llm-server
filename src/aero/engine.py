@@ -175,6 +175,7 @@ def model_info() -> list[dict]:
             "max_tokens": cfg.max_tokens,
             "tools": supports_tools(name),
             "system": cfg.system,
+            "knowledge": cfg.knowledge,
         })
     return info
 
@@ -570,13 +571,62 @@ def _tool_system_prompt(request: ChatCompletionRequest) -> str:
     return prompt
 
 
-def _effective_kwargs(request: ChatCompletionRequest, cfg: ModelConfig) -> dict:
+# Safety cap on injected RAG context, so retrieval can't blow the (small) context
+# budget regardless of chunk size x top_k.
+_MAX_CONTEXT_CHARS = 12000
+
+
+def _retrieve(request: ChatCompletionRequest, cfg: ModelConfig) -> list[dict]:
+    """Retrieve grounding chunks when the model has a knowledge base, else [].
+
+    Queries on the last user message. Never raises: a missing or broken KB degrades
+    to an ungrounded answer (logged), so attaching a KB can't take chat down."""
+    if not cfg.knowledge:
+        return []
+    query = next((m.content for m in reversed(request.messages)
+                  if m.role == "user" and m.content), None)
+    if not query:
+        return []
+    try:
+        from . import rag
+
+        return rag.search(_home, cfg.knowledge, query, k=cfg.knowledge_top_k)
+    except Exception:  # noqa: BLE001 - retrieval is best-effort
+        logger.warning("knowledge retrieval failed (kb=%s)", cfg.knowledge, exc_info=True)
+        return []
+
+
+def _format_context(sources: list[dict]) -> str:
+    """Render retrieved chunks into a system-prompt context block with [n] tags."""
+    blocks, used = [], 0
+    for i, s in enumerate(sources, start=1):
+        text = s["text"]
+        if used + len(text) > _MAX_CONTEXT_CHARS:
+            text = text[: max(0, _MAX_CONTEXT_CHARS - used)]
+        blocks.append(f"[{i}] (source: {s['source']})\n{text}")
+        used += len(text)
+        if used >= _MAX_CONTEXT_CHARS:
+            break
+    body = "\n\n".join(blocks)
+    return (
+        "You have access to the following context from a knowledge base. Use it to "
+        "answer the user's question. If the answer is not in the context, say you don't "
+        "know rather than guessing. Cite sources inline using their [n] tags.\n\n"
+        f"<context>\n{body}\n</context>"
+    )
+
+
+def _effective_kwargs(
+    request: ChatCompletionRequest, cfg: ModelConfig, context: Optional[str] = None
+) -> dict:
     """Build create_chat_completion args, layering per-model config under the request.
 
     Merging:
       * Default system prompt -- injected only if the request has no system message.
       * Tool instructions      -- when the request carries tools, appended to the
         system message (model-agnostic; see _tool_system_prompt).
+      * RAG context            -- when ``context`` is given (the model has a knowledge
+        base), appended to the system message too (see _format_context / _retrieve).
       * Sampling / max_tokens   -- the request wins for any field it set explicitly
         (tracked via Pydantic's model_fields_set); otherwise the model's config
         default applies; otherwise the schema's built-in default.
@@ -587,14 +637,20 @@ def _effective_kwargs(request: ChatCompletionRequest, cfg: ModelConfig) -> dict:
     if cfg.system and not any(m["role"] == "system" for m in messages):
         messages = [{"role": "system", "content": cfg.system}] + messages
 
+    # Tool instructions and RAG context both augment the system message.
+    additions = []
     if request.tools:
-        instructions = _tool_system_prompt(request)
+        additions.append(_tool_system_prompt(request))
+    if context:
+        additions.append(context)
+    if additions:
+        extra = "\n\n".join(additions)
         sys_idx = next((i for i, m in enumerate(messages) if m["role"] == "system"), None)
         if sys_idx is not None:
             base = messages[sys_idx].get("content") or ""
-            messages[sys_idx] = {**messages[sys_idx], "content": f"{base}\n\n{instructions}".strip()}
+            messages[sys_idx] = {**messages[sys_idx], "content": f"{base}\n\n{extra}".strip()}
         else:
-            messages = [{"role": "system", "content": instructions}] + messages
+            messages = [{"role": "system", "content": extra}] + messages
 
     def pick(field: str, cfg_val: Any) -> Any:
         if field in request.model_fields_set:
@@ -632,28 +688,30 @@ def _stub_tool_call(request: ChatCompletionRequest) -> dict:
     return {"id": "call_stub0", "type": "function", "function": {"name": fn, "arguments": "{}"}}
 
 
-def run_inference(request: ChatCompletionRequest) -> tuple[dict, str, Usage]:
+def run_inference(request: ChatCompletionRequest) -> tuple[dict, str, Usage, list[dict]]:
     """Run a (non-streaming) chat completion, loading the model if needed.
 
-    Returns ``(message, finish_reason, usage)`` where ``message`` is the assistant
-    message dict (``content`` and/or ``tool_calls``). finish_reason is "stop",
-    "length" (hit max_tokens), or "tool_calls"; usage carries the token counts.
+    Returns ``(message, finish_reason, usage, sources)`` where ``message`` is the
+    assistant message dict (``content`` and/or ``tool_calls``) and ``sources`` is the
+    list of retrieved RAG chunks (empty unless the model has a knowledge base).
+    finish_reason is "stop", "length" (hit max_tokens), or "tool_calls".
     """
     with _lock:
         handle = _acquire_handle(request.model)
         cfg = _models[request.model]
+        sources = _retrieve(request, cfg)
 
         if _backend == "stub":
             if request.tools:
                 msg = {"role": "assistant", "content": None, "tool_calls": [_stub_tool_call(request)]}
-                return msg, "tool_calls", _usage(_stub_prompt_tokens(request), 1)
+                return msg, "tool_calls", _usage(_stub_prompt_tokens(request), 1), sources
             last = request.messages[-1].content if request.messages else ""
             text = f"[stub:{request.model}] echo: {last}"
-            return {"role": "assistant", "content": text}, "stop", _usage(
-                _stub_prompt_tokens(request), len(text.split())
-            )
+            return ({"role": "assistant", "content": text}, "stop",
+                    _usage(_stub_prompt_tokens(request), len(text.split())), sources)
 
-        result = handle.create_chat_completion(**_effective_kwargs(request, cfg))
+        context = _format_context(sources) if sources else None
+        result = handle.create_chat_completion(**_effective_kwargs(request, cfg, context))
         choice, u = result["choices"][0], result["usage"]
         message = choice["message"]
         finish_reason = choice.get("finish_reason") or "stop"
@@ -664,7 +722,7 @@ def run_inference(request: ChatCompletionRequest) -> tuple[dict, str, Usage]:
             if parsed:
                 message = {"role": "assistant", "content": None, "tool_calls": parsed}
                 finish_reason = "tool_calls"
-        return message, finish_reason, _usage(u["prompt_tokens"], u["completion_tokens"])
+        return message, finish_reason, _usage(u["prompt_tokens"], u["completion_tokens"]), sources
 
 
 def stream_inference(
@@ -684,6 +742,12 @@ def stream_inference(
         finish_reason = "stop"
         pieces: list[str] = []
 
+        # Retrieval happens before generation, so citations are known up front.
+        sources = _retrieve(request, cfg)
+        if sources:
+            yield "sources", sources
+        context = _format_context(sources) if sources else None
+
         if _backend == "stub":
             if request.tools:
                 yield "delta", {"role": "assistant", "tool_calls": [{"index": 0, **_stub_tool_call(request)}]}
@@ -698,7 +762,7 @@ def stream_inference(
             # buffer the stream and parse at the end, emitting one tool_calls delta
             # (or the content if it wasn't a tool call). Plain text isn't token-
             # streamed here, but a tool-using turn isn't useful half-parsed anyway.
-            kwargs = _effective_kwargs(request, cfg)
+            kwargs = _effective_kwargs(request, cfg, context)
             buf: list[str] = []
             for chunk in handle.create_chat_completion(**kwargs, stream=True):
                 choice = chunk["choices"][0]
@@ -718,7 +782,7 @@ def stream_inference(
             elif text:
                 yield "delta", {"content": text}
         else:
-            kwargs = _effective_kwargs(request, cfg)
+            kwargs = _effective_kwargs(request, cfg, context)
             for chunk in handle.create_chat_completion(**kwargs, stream=True):
                 choice = chunk["choices"][0]
                 if choice.get("finish_reason"):
