@@ -25,6 +25,7 @@ from .schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
+    EmbeddingRequest,
 )
 
 logger = logging.getLogger("aero.server")
@@ -51,6 +52,30 @@ def list_models() -> dict:
         for name in engine.available_models()
     ]
     return {"object": "list", "data": data}
+
+
+@app.post("/v1/embeddings")
+def embeddings(request: EmbeddingRequest) -> dict:
+    """OpenAI-compatible embeddings. Powers RAG internally and works as a drop-in
+    local embeddings provider for any client."""
+    texts = [request.input] if isinstance(request.input, str) else list(request.input)
+    if not texts:
+        raise HTTPException(status_code=400, detail="`input` must be a non-empty string or list")
+    try:
+        vectors = engine.embed(request.model, texts)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001 - surface backend errors as a clean 400
+        raise HTTPException(status_code=400, detail=f"embedding failed: {exc}")
+    tokens = sum(len(t.split()) for t in texts)  # rough; llama.cpp doesn't surface counts here
+    return {
+        "object": "list",
+        "model": request.model,
+        "data": [
+            {"object": "embedding", "index": i, "embedding": v} for i, v in enumerate(vectors)
+        ],
+        "usage": {"prompt_tokens": tokens, "total_tokens": tokens},
+    }
 
 
 def _sse(data: dict) -> str:
@@ -268,6 +293,12 @@ def list_installed_models() -> dict:
     """Installed models with size, base, config fields, and reference info (for delete)."""
     registry = engine.current_models()
     return {"models": [_model_detail(n, c, registry) for n, c in sorted(registry.items())]}
+
+
+@app.get("/api/embedders")
+def list_embedders() -> dict:
+    """Installed embedding models (for the KB editor's embedder picker)."""
+    return {"embedders": engine.available_embedders(), "loaded": engine.loaded_embedder()}
 
 
 @app.get("/api/models/repo")
