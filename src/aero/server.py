@@ -98,7 +98,7 @@ def chat_completions(request: ChatCompletionRequest):
         )
 
     if not request.stream:
-        message, finish_reason, usage = engine.run_inference(request)
+        message, finish_reason, usage, sources = engine.run_inference(request)
         return ChatCompletionResponse(
             model=request.model,
             choices=[
@@ -112,6 +112,7 @@ def chat_completions(request: ChatCompletionRequest):
                 )
             ],
             usage=usage,
+            sources=sources or None,
         )
 
     # Streaming: relay the engine's events as OpenAI chat.completion.chunk frames.
@@ -122,7 +123,19 @@ def chat_completions(request: ChatCompletionRequest):
     def event_stream():
         try:
             for kind, payload in engine.stream_inference(request):
-                if kind == "delta":
+                if kind == "sources":
+                    # Retrieved RAG sources, known before generation. Carried as an
+                    # extra key on an otherwise-valid (empty-delta) chunk, so standard
+                    # OpenAI stream parsers ignore it and our UI can read it.
+                    yield _sse(
+                        {
+                            "object": "chat.completion.chunk",
+                            "model": request.model,
+                            "choices": [{"index": 0, "delta": {}}],
+                            "sources": payload,
+                        }
+                    )
+                elif kind == "delta":
                     yield _sse(
                         {
                             "object": "chat.completion.chunk",
@@ -282,6 +295,8 @@ def _model_detail(name: str, cfg, registry: dict) -> dict:
         "tools": engine.supports_tools(name),
         "chat_format": cfg.chat_format,
         "system": cfg.system,
+        "knowledge": cfg.knowledge,
+        "knowledge_top_k": cfg.knowledge_top_k,
         "sampling": cfg.sampling.model_dump(exclude_none=True),
         "has_config_file": bool(toml_path and toml_path.is_file()),
         "referenced_by": sorted(n for n, c in registry.items() if n != name and c.path == cfg.path),
@@ -372,6 +387,8 @@ class ModelConfigBody(BaseModel):
     max_tokens: Optional[int] = None
     tools: Optional[bool] = None
     chat_format: Optional[str] = None
+    knowledge: Optional[str] = None                  # knowledge base name (RAG)
+    knowledge_top_k: Optional[int] = None
     sampling: Optional[dict] = None
 
 
@@ -379,7 +396,8 @@ def _fields(body: ModelConfigBody) -> dict:
     f: dict = {}
     if body.base is not None:
         f["from"] = body.base
-    for k in ("system", "n_ctx", "kv_cache_type", "max_tokens", "tools", "chat_format"):
+    for k in ("system", "n_ctx", "kv_cache_type", "max_tokens", "tools", "chat_format",
+              "knowledge", "knowledge_top_k"):
         v = getattr(body, k)
         if v is not None:
             f[k] = v

@@ -127,3 +127,6 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+    # aero extension: retrieved RAG sources, when the model has a knowledge base.
+    # Additive and omitted when empty, so standard OpenAI clients are unaffected.
+    sources: Optional[list[dict]] = None
