@@ -94,6 +94,16 @@ class ChatCompletionRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
+class EmbeddingRequest(BaseModel):
+    """Body of ``POST /v1/embeddings`` (OpenAI-compatible).
+
+    ``input`` is one string or a list of strings; ``model`` names an installed
+    embedder (see engine's embedder slot)."""
+
+    model: str
+    input: Union[str, list[str]]
+
+
 class Usage(BaseModel):
     """Token accounting. Populated with real counts from the inference result."""
 

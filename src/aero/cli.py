@@ -131,8 +131,14 @@ def pull(
         None, help="GGUF filename in the repo. Omit to list the repo's available GGUF files."
     ),
     home: Path = _home_opt,
+    embedder: bool = typer.Option(
+        False, "--embedder", help="Install as an embedding model (into embedders/, no chat config)."
+    ),
 ) -> None:
-    """Download a GGUF from Hugging Face and create a model definition."""
+    """Download a GGUF from Hugging Face and create a model definition.
+
+    With ``--embedder`` the GGUF goes into ``embedders/`` and no chat definition is
+    written, so it's available to `/v1/embeddings` and RAG but never offered for chat."""
     try:
         import huggingface_hub  # noqa: F401  (store_ops imports it lazily)
     except ImportError as exc:
@@ -149,8 +155,8 @@ def pull(
         typer.echo(f"\nRe-run with one, e.g.:  aero pull {repo} {ggufs[0]['filename']}")
         return
 
-    gguf_dir = store.gguf_dir(home)
-    typer.echo(f"Downloading {repo}/{filename} -> {gguf_dir} ...")
+    dest = store.embedders_dir(home) if embedder else store.gguf_dir(home)
+    typer.echo(f"Downloading {repo}/{filename} -> {dest} ...")
 
     def progress(downloaded: int, total: int) -> None:
         if total:
@@ -159,11 +165,14 @@ def pull(
         else:
             print(f"\r  {store.human_size(downloaded)}", end="", flush=True)
 
-    path = store_ops.download_gguf(repo, filename, gguf_dir, progress_cb=progress)
+    path = store_ops.download_gguf(repo, filename, dest, progress_cb=progress)
     print()  # end the progress line
-    toml_path = store_ops.write_starter_config(home, path.stem)
     typer.echo(f"Pulled {path.stem}  ({store.human_size(path.stat().st_size)})")
-    typer.echo(f"  definition: {toml_path}")
+    if embedder:
+        typer.echo("  installed as an embedding model (use it for /v1/embeddings and RAG).")
+    else:
+        toml_path = store_ops.write_starter_config(home, path.stem)
+        typer.echo(f"  definition: {toml_path}")
 
 
 @app.command("list")

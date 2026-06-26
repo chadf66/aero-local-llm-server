@@ -32,6 +32,12 @@ def config_dir(home: Path) -> Path:
     return home / "models"
 
 
+def embedders_dir(home: Path) -> Path:
+    """Directory of embedding-model GGUFs (kept apart from chat `gguf/` so the chat
+    registry never tries to chat with an embedder). See engine's embedder slot."""
+    return home / "embedders"
+
+
 def db_path(home: Path) -> Path:
     """SQLite file backing the web UI's conversation history (Phase f)."""
     return home / "aero.db"

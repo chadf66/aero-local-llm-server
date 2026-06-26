@@ -67,6 +67,16 @@ _lock = threading.RLock()
 _idle_thread: Optional[threading.Thread] = None
 _idle_stop = threading.Event()
 
+# A SECOND resident slot, for an embedding model (Phase g). Embedders are tiny
+# (~90-300 MB) next to chat weights, so we let one stay loaded *alongside* the chat
+# model -- a deliberate exception to single-resident, since RAG needs to embed the
+# query at the same time the chat model answers. Guarded by the same _lock.
+_embedder_handle: Any = None
+_embedder_name: Optional[str] = None
+_embedder_dim: Optional[int] = None
+_embedder_last_used = 0.0
+_STUB_EMBED_DIM = 64                    # fixed dim for the stub backend's fake vectors
+
 
 def configure(
     models: dict[str, ModelConfig],
@@ -86,6 +96,7 @@ def configure(
     global _models, _backend, _idle_timeout, _mem_fraction, _home, _registry_defaults
     with _lock:
         _unload()  # drop any model loaded under the previous config
+        _unload_embedder()
         _models = dict(models)
         _backend = backend
         _idle_timeout = float(idle_timeout)
@@ -144,6 +155,11 @@ def available_models() -> list[str]:
 def loaded_model() -> Optional[str]:
     """The model currently resident in memory, or None."""
     return _loaded_name
+
+
+def loaded_embedder() -> Optional[str]:
+    """The embedding model currently resident (second slot), or None."""
+    return _embedder_name
 
 
 def model_info() -> list[dict]:
@@ -337,20 +353,138 @@ def _acquire_handle(name: str) -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# Embeddings (the second resident slot; Phase g). Co-resident with the chat model.
+# --------------------------------------------------------------------------- #
+
+
+def available_embedders() -> list[str]:
+    """Embedding models installed under ``embedders/`` (GGUF stems), sorted."""
+    if _home is None:
+        return []
+    from . import store
+
+    d = store.embedders_dir(_home)
+    return sorted(p.stem for p in d.glob("*.gguf")) if d.is_dir() else []
+
+
+def _stub_embed(text: str) -> list[float]:
+    """A deterministic, normalized fake embedding for the stub backend (no model).
+
+    Same text -> same vector, different text -> different; good enough to exercise
+    ingest/search/round-trip in tests without downloading an embedder."""
+    import hashlib
+    import math
+    import struct
+
+    raw = b""
+    i = 0
+    while len(raw) < _STUB_EMBED_DIM * 4:
+        raw += hashlib.sha256(f"{text}#{i}".encode()).digest()
+        i += 1
+    vals = [struct.unpack("<I", raw[j:j + 4])[0] / 2**32 - 0.5 for j in range(0, _STUB_EMBED_DIM * 4, 4)]
+    norm = math.sqrt(sum(v * v for v in vals)) or 1.0
+    return [v / norm for v in vals]
+
+
+def _load_embedder(name: str) -> None:
+    global _embedder_handle, _embedder_name, _embedder_dim
+    if _backend == "stub":
+        _embedder_handle = name
+        _embedder_dim = _STUB_EMBED_DIM
+    elif _backend == "llama":
+        from llama_cpp import Llama
+
+        from . import store
+
+        if _home is None:
+            raise RuntimeError("no aero home configured; cannot locate embedders")
+        path = store.embedders_dir(_home) / f"{name}.gguf"
+        if not path.is_file():
+            raise FileNotFoundError(f"embedder {name!r} not found at {path}")
+        _embedder_handle = Llama(model_path=str(path), embedding=True, n_gpu_layers=-1, verbose=False)
+        _embedder_dim = int(_embedder_handle.n_embd())
+    else:
+        raise ValueError(f"unknown backend {_backend!r}")
+    _embedder_name = name
+    logger.info("loaded embedder %s (dim=%s)", name, _embedder_dim)
+
+
+def _unload_embedder() -> None:
+    global _embedder_handle, _embedder_name, _embedder_dim
+    if _embedder_name is None:
+        return
+    name = _embedder_name
+    if _backend == "llama" and hasattr(_embedder_handle, "close"):
+        try:
+            _embedder_handle.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("error freeing embedder %s", name, exc_info=True)
+    _embedder_handle = None
+    _embedder_name = None
+    _embedder_dim = None
+    logger.info("unloaded embedder %s", name)
+
+
+def embedder_dim(name: str) -> Optional[int]:
+    """Output dimension of an embedder (loading it if needed)."""
+    with _lock:
+        if _embedder_name != name:
+            _unload_embedder()
+            _load_embedder(name)
+        return _embedder_dim
+
+
+def embed(model: str, texts: list[str]) -> list[list[float]]:
+    """Embed ``texts`` with embedding model ``model`` (load co-resident as needed).
+
+    Returns one vector per input. Used by ``/v1/embeddings`` and the RAG pipeline.
+    The chat model, if any, stays loaded -- this is the second slot.
+    """
+    global _embedder_last_used
+    with _lock:
+        if _backend == "stub":
+            _embedder_name_set(model)
+            _embedder_last_used = time.monotonic()
+            return [_stub_embed(t) for t in texts]
+
+        if _embedder_name != model:
+            _unload_embedder()
+            _load_embedder(model)
+        out = _embedder_handle.create_embedding(input=texts)
+        _embedder_last_used = time.monotonic()
+        return [d["embedding"] for d in out["data"]]
+
+
+def _embedder_name_set(name: str) -> None:
+    """Stub helper: record the embedder name/dim without loading anything real."""
+    global _embedder_name, _embedder_dim
+    _embedder_name = name
+    _embedder_dim = _STUB_EMBED_DIM
+
+
+# --------------------------------------------------------------------------- #
 # Idle-unload sweep.
 # --------------------------------------------------------------------------- #
 
 
 def _unload_if_idle() -> bool:
-    """Free the resident model if it has been idle past the timeout. Testable seam."""
+    """Free the resident chat model and/or embedder if idle past the timeout.
+
+    Testable seam. Returns True if anything was unloaded."""
     with _lock:
-        if _loaded_name is None or _idle_timeout <= 0:
+        if _idle_timeout <= 0:
             return False
-        if time.monotonic() - _last_used > _idle_timeout:
+        now = time.monotonic()
+        freed = False
+        if _loaded_name is not None and now - _last_used > _idle_timeout:
             logger.info("idle-unloading %s after %.0fs", _loaded_name, _idle_timeout)
             _unload()
-            return True
-        return False
+            freed = True
+        if _embedder_name is not None and now - _embedder_last_used > _idle_timeout:
+            logger.info("idle-unloading embedder %s after %.0fs", _embedder_name, _idle_timeout)
+            _unload_embedder()
+            freed = True
+        return freed
 
 
 def _idle_loop() -> None:
