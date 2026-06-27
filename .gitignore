@@ -223,6 +223,3 @@ __marimo__/
 # produced by `make ui` into the package; it's generated, so we don't commit it.
 webui/node_modules/
 src/aero/webui_dist/
-
-# Forward-looking phase plan (working doc; deleted at end of phase g, not for the public repo)
-PLAN.md
