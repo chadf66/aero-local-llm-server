@@ -156,3 +156,28 @@ def test_pull_streams_progress_and_registers(home, client, monkeypatch):
     names = {m["name"] for m in client.get("/api/models").json()["models"]}
     assert "NewModel" in names
     assert (store.config_dir(home) / "NewModel.toml").is_file()
+
+
+def test_pull_embedder_lands_in_embedders_dir(home, client, monkeypatch):
+    captured = {}
+
+    def fake_download(repo, filename, dest_dir, progress_cb=None):
+        from pathlib import Path
+        captured["dest"] = Path(dest_dir)
+        Path(dest_dir).mkdir(parents=True, exist_ok=True)
+        dest = Path(dest_dir) / Path(filename).name
+        if progress_cb:
+            progress_cb(100, 100)
+        dest.write_bytes(b"\x00")
+        return dest
+
+    monkeypatch.setattr(store_ops, "download_gguf", fake_download)
+    with client.stream("GET", "/api/models/pull?repo=r&filename=Embed.gguf&embedder=true") as resp:
+        events = [json.loads(l[6:]) for l in resp.iter_lines()
+                  if l.startswith("data: ") and l != "data: [DONE]"]
+    assert events[-1]["type"] == "done" and events[-1]["name"] == "Embed"
+    # Landed in embedders/, NOT gguf/, and got no chat config — but shows up as an embedder.
+    assert captured["dest"] == store.embedders_dir(home)
+    assert not (store.config_dir(home) / "Embed.toml").exists()
+    assert "Embed" not in {m["name"] for m in client.get("/api/models").json()["models"]}
+    assert "Embed" in client.get("/api/embedders").json()["embedders"]

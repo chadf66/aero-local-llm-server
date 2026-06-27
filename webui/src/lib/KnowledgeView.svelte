@@ -2,7 +2,7 @@
   import { createEventDispatcher, onMount } from "svelte";
   import {
     listKbs, getKb, createKb, deleteKb, removeKbFile,
-    ingestKb, syncKb, listEmbedders,
+    ingestKb, syncKb, listEmbedders, listRepoModels, pullModel,
   } from "./api.js";
 
   const dispatch = createEventDispatcher();
@@ -11,6 +11,59 @@
   let embedders = [];
   let loading = true;
   let error = "";
+
+  // embedder pull-from-HF state
+  let erepo = "";
+  let equants = null; // null until listed; [] if none
+  let elisting = false;
+  let erepoError = "";
+  let epulling = null; // filename being pulled
+  let eprogress = null; // {pct, downloaded, total}
+  let epullError = "";
+
+  function fmtSize(b) {
+    if (b == null) return "—";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, n = b;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+  }
+
+  async function listEQuants() {
+    if (!erepo.trim()) return;
+    elisting = true;
+    erepoError = "";
+    equants = null;
+    try {
+      equants = (await listRepoModels(erepo.trim())).files;
+    } catch (e) {
+      erepoError = String(e).replace(/^Error:\s*\d+:\s*/, "");
+    } finally {
+      elisting = false;
+    }
+  }
+
+  async function doPullEmbedder(filename) {
+    epulling = filename;
+    epullError = "";
+    eprogress = { pct: 0, downloaded: 0, total: 0 };
+    try {
+      await pullModel(erepo.trim(), filename, (ev) => {
+        if (ev.type === "progress") eprogress = ev;
+        else if (ev.type === "error") epullError = ev.detail;
+      }, undefined, true);
+      if (!epullError) {
+        equants = null;
+        erepo = "";
+        await reloadAndNotify();
+      }
+    } catch (e) {
+      epullError = String(e);
+    } finally {
+      epulling = null;
+      eprogress = null;
+    }
+  }
 
   // create form
   let creating = false;
@@ -52,7 +105,7 @@
   async function create() {
     error = "";
     if (!newName.trim()) { error = "Give the KB a name."; return; }
-    if (!newEmbedder) { error = "No embedder installed — pull one first (aero pull <repo> <file> --embedder)."; return; }
+    if (!newEmbedder) { error = "No embedder installed — pull one in the Embedders panel first."; return; }
     try {
       await createKb({ name: newName.trim(), embedder: newEmbedder });
       creating = false;
@@ -141,8 +194,7 @@
           </label>
         </div>
         {#if embedders.length === 0}
-          <p class="small muted">No embedders installed. Pull one first:
-            <code>aero pull &lt;repo&gt; &lt;file&gt; --embedder</code></p>
+          <p class="small muted">No embedders installed. Pull one in the <strong>Embedders</strong> panel below first.</p>
         {/if}
         <div class="actions">
           <button on:click={() => (creating = false)}>Cancel</button>
@@ -150,6 +202,55 @@
         </div>
       </section>
     {/if}
+
+    <section class="panel">
+      <h3>Embedders</h3>
+      <p class="small muted hint">
+        Small models that turn text into vectors. A knowledge base is built with one and must
+        keep using it. Good picks: <code>nomic-embed-text-v1.5</code> (versatile) or
+        <code>bge-small-en-v1.5</code> (tiny).
+      </p>
+      <div class="pullbar">
+        <input
+          placeholder="repo id, e.g. nomic-ai/nomic-embed-text-v1.5-GGUF"
+          bind:value={erepo}
+          on:keydown={(e) => e.key === "Enter" && listEQuants()}
+        />
+        <button on:click={listEQuants} disabled={elisting || !erepo.trim()}>
+          {elisting ? "Listing…" : "List quants"}
+        </button>
+      </div>
+      {#if erepoError}<p class="error small">{erepoError}</p>{/if}
+      {#if equants}
+        {#if equants.length === 0}
+          <p class="small muted">No GGUF files in that repo.</p>
+        {:else}
+          <ul class="quants">
+            {#each equants as q}
+              <li>
+                <span class="qname">{q.filename}</span>
+                <span class="muted small">{fmtSize(q.size)}</span>
+                {#if epulling === q.filename}
+                  <div class="bar"><div class="fill" style="width:{eprogress?.pct ?? 0}%"></div></div>
+                  <span class="small muted">{eprogress?.pct != null ? eprogress.pct + "%" : "…"}</span>
+                {:else}
+                  <button on:click={() => doPullEmbedder(q.filename)} disabled={epulling != null}>Pull</button>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/if}
+      {#if epullError}<p class="error small">{epullError}</p>{/if}
+
+      {#if embedders.length}
+        <ul class="installed">
+          {#each embedders as e}<li><span class="qname">{e}</span><span class="badge">installed</span></li>{/each}
+        </ul>
+      {:else if !loading}
+        <p class="small muted">None installed yet — pull one above.</p>
+      {/if}
+    </section>
 
     <section class="panel">
       <h3>Bases</h3>
@@ -251,6 +352,17 @@
   .ops { text-align: right; white-space: nowrap; }
   .ops button { border: 1px solid var(--border); }
   .ops .del:hover { color: var(--danger); border-color: var(--danger); }
+
+  .hint { margin: 0 0 0.7rem; line-height: 1.45; }
+  .pullbar { display: flex; gap: 0.5rem; }
+  .pullbar input { flex: 1; background: var(--elevated); }
+  .pullbar button, .quants button { border: 1px solid var(--border); }
+  .quants { list-style: none; margin: 0.7rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
+  .quants li { display: flex; align-items: center; gap: 0.7rem; padding: 0.35rem 0; }
+  .qname { flex: 1; font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; }
+  .installed { list-style: none; margin: 0.8rem 0 0; padding: 0.7rem 0 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 0.3rem; }
+  .installed li { display: flex; align-items: center; gap: 0.7rem; }
+  .installed .badge { color: var(--ok); }
 
   .detail-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.7rem; }
   .detail-head h3 { margin: 0; }

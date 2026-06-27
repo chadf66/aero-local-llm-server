@@ -5,9 +5,11 @@
 
   export let message; // { role, content, tool_calls }
   export let toolResults = {}; // tool_call_id -> result content
+  export let thinking = false; // assistant turn in flight with nothing rendered yet
 
   $: isUser = message.role === "user";
   $: segments = message.content ? splitThinking(message.content) : [];
+  $: showThinking = thinking && !message.content && !message.tool_calls;
 </script>
 
 <div class="row" class:user={isUser}>
@@ -29,6 +31,12 @@
           <div class="md">{@html renderMarkdown(seg.text)}</div>
         {/if}
       {/each}
+
+      {#if showThinking}
+        <div class="thinking" aria-label="Thinking">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        </div>
+      {/if}
 
       {#if message.tool_calls}
         {#each message.tool_calls as call}
@@ -93,6 +101,20 @@
   .md :global(h1), .md :global(h2), .md :global(h3) { margin: 1rem 0 0.5rem; line-height: 1.3; }
   .md :global(table) { border-collapse: collapse; margin: 0.6rem 0; }
   .md :global(th), .md :global(td) { border: 1px solid var(--border); padding: 0.35rem 0.6rem; }
+
+  /* Animated "thinking" dots shown while the assistant turn is in flight. */
+  .thinking { display: flex; gap: 0.3rem; padding: 0.35rem 0; }
+  .thinking .dot {
+    width: 0.45rem; height: 0.45rem; border-radius: 50%;
+    background: var(--muted); opacity: 0.4;
+    animation: blink 1.4s infinite ease-in-out both;
+  }
+  .thinking .dot:nth-child(2) { animation-delay: 0.2s; }
+  .thinking .dot:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); }
+    40% { opacity: 0.9; transform: scale(1); }
+  }
 
   .sources { margin-top: 0.6rem; border-top: 1px solid var(--border); padding-top: 0.4rem; }
   .sources summary { cursor: pointer; color: var(--muted); font-size: 0.82rem; }
