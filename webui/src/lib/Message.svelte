@@ -35,6 +35,22 @@
           <ToolCard {call} result={toolResults[call.id] ?? null} />
         {/each}
       {/if}
+
+      {#if message.sources && message.sources.length}
+        <details class="sources">
+          <summary>📚 {message.sources.length} source{message.sources.length > 1 ? "s" : ""}</summary>
+          {#each message.sources as s, i}
+            <div class="src">
+              <div class="src-head small">
+                <span class="tag">[{i + 1}]</span>
+                <code>{s.source}</code>
+                {#if s.score != null}<span class="muted">· {(s.score * 100).toFixed(0)}%</span>{/if}
+              </div>
+              <p class="src-text small muted">{(s.text || "").slice(0, 240)}…</p>
+            </div>
+          {/each}
+        </details>
+      {/if}
     </div>
   </div>
 </div>
@@ -77,4 +93,11 @@
   .md :global(h1), .md :global(h2), .md :global(h3) { margin: 1rem 0 0.5rem; line-height: 1.3; }
   .md :global(table) { border-collapse: collapse; margin: 0.6rem 0; }
   .md :global(th), .md :global(td) { border: 1px solid var(--border); padding: 0.35rem 0.6rem; }
+
+  .sources { margin-top: 0.6rem; border-top: 1px solid var(--border); padding-top: 0.4rem; }
+  .sources summary { cursor: pointer; color: var(--muted); font-size: 0.82rem; }
+  .src { margin: 0.5rem 0 0; }
+  .src-head { display: flex; align-items: center; gap: 0.4rem; }
+  .tag { color: var(--accent); }
+  .src-text { margin: 0.2rem 0 0; line-height: 1.4; }
 </style>

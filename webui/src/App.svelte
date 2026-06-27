@@ -5,6 +5,7 @@
   import Message from "./lib/Message.svelte";
   import Knobs from "./lib/Knobs.svelte";
   import ModelsView from "./lib/ModelsView.svelte";
+  import KnowledgeView from "./lib/KnowledgeView.svelte";
 
   const emptyChat = () => ({ id: null, title: "New chat", model: "", system: "", messages: [] });
 
@@ -21,7 +22,7 @@
 
   let knobs = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: null };
   let showSettings = false;
-  let view = "chat"; // "chat" | "models"
+  let view = "chat"; // "chat" | "models" | "knowledge"
 
   async function onModelsChanged() {
     await refreshState();
@@ -143,6 +144,7 @@
     try {
       for await (const chunk of api.streamChat(body, controller.signal)) {
         if (chunk.error) { error = chunk.error.message || "server error"; continue; }
+        if (chunk.sources) { assistant.sources = chunk.sources; current.messages = current.messages; }
         const delta = chunk.choices?.[0]?.delta;
         if (!delta) continue;
         if (delta.content) assistant.content += delta.content;
@@ -208,10 +210,13 @@
     on:delete={(e) => removeChat(e.detail)}
     on:search={(e) => refreshList(e.detail)}
     on:manage={() => (view = "models")}
+    on:knowledge={() => (view = "knowledge")}
   />
 
   {#if view === "models"}
     <ModelsView on:back={() => (view = "chat")} on:changed={onModelsChanged} />
+  {:else if view === "knowledge"}
+    <KnowledgeView on:back={() => (view = "chat")} on:changed={onModelsChanged} />
   {:else}
   <main>
     <header>

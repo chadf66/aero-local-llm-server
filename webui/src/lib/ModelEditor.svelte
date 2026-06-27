@@ -1,6 +1,6 @@
 <script>
   import { createEventDispatcher, onMount } from "svelte";
-  import { createModel, editModel, getSizing } from "./api.js";
+  import { createModel, editModel, getSizing, listKbs } from "./api.js";
 
   export let model = null; // existing detail dict to edit, or null to create
   export let bases = []; // installed model/GGUF names available as `from`
@@ -16,9 +16,20 @@
   let kv = model?.kv_cache_type ?? "f16";
   let maxTokens = model?.max_tokens ?? "";
   let tools = model?.tools ?? false;
+  let knowledge = model?.knowledge ?? "";
+  let knowledgeTopK = model?.knowledge_top_k ?? 4;
+  let kbs = [];
   let temperature = model?.sampling?.temperature ?? "";
   let top_p = model?.sampling?.top_p ?? "";
   let top_k = model?.sampling?.top_k ?? "";
+
+  onMount(async () => {
+    try {
+      kbs = (await listKbs()).kbs.map((k) => k.name);
+    } catch {
+      kbs = [];
+    }
+  });
 
   let saving = false;
   let error = "";
@@ -45,6 +56,10 @@
     body.kv_cache_type = kv;
     if (maxTokens !== "" && maxTokens != null) body.max_tokens = Number(maxTokens);
     if (tools) body.tools = true;
+    if (knowledge) {
+      body.knowledge = knowledge;
+      body.knowledge_top_k = Number(knowledgeTopK) || 4;
+    }
     const s = {};
     if (temperature !== "") s.temperature = Number(temperature);
     if (top_p !== "") s.top_p = Number(top_p);
@@ -134,6 +149,24 @@
       <label class="check"><input type="checkbox" bind:checked={tools} /> enable tool/function calling</label>
     </label>
   </div>
+
+  <div class="row2">
+    <label class="field">
+      <span>Knowledge base (RAG)</span>
+      <select bind:value={knowledge}>
+        <option value="">none</option>
+        {#if knowledge && !kbs.includes(knowledge)}<option value={knowledge}>{knowledge}</option>{/if}
+        {#each kbs as kb}<option value={kb}>{kb}</option>{/each}
+      </select>
+    </label>
+    <label class="field">
+      <span>retrieved chunks (top_k)</span>
+      <input type="number" min="1" max="20" bind:value={knowledgeTopK} disabled={!knowledge} />
+    </label>
+  </div>
+  {#if knowledge}
+    <p class="small muted fits">Answers will be grounded in <code>{knowledge}</code> — the top {knowledgeTopK} matching chunks are injected and cited.</p>
+  {/if}
 
   <div class="row3">
     <label class="field"><span>temperature</span><input type="number" step="0.05" bind:value={temperature} placeholder="0.7" /></label>

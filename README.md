@@ -10,8 +10,9 @@ time, inference on the Metal GPU. No Docker, no router/worker split, no auth.
 
 > **Status:** feature-complete. MVP plus per-model config, config/weights decoupling
 > (one GGUF, many models), memory-aware auto context sizing, **tool calling** for agent
-> harnesses, and a **web UI** with searchable history *and* full **model management**
-> (pull, create/edit configs, delete — applied live, no restart).
+> harnesses, a **web UI** with searchable history *and* full **model management** (pull,
+> create/edit configs, delete — applied live, no restart), and **local RAG** —
+> knowledge bases with an OpenAI-compatible `/v1/embeddings` endpoint.
 
 ## Install
 
@@ -221,6 +222,44 @@ aero run qwen-pirate     # same weights as Qwen, different personality
 If two models resolve to the same weights and context settings, switching between
 them is a **persona swap with no reload** — the engine keeps the model resident and
 just changes the prompt.
+
+## Knowledge bases (RAG)
+
+Ground a model in your own documents — a local "custom GPT." Everything runs on the
+Mac: a small GGUF **embedding model** (loaded alongside the chat model) plus an
+on-disk **LanceDB** vector store, so the corpus lives on disk, not in RAM.
+
+```sh
+# 1. Install an embedding model (its own dir; never offered for chat)
+aero pull nomic-ai/nomic-embed-text-v1.5-GGUF nomic-embed-text-v1.5.Q8_0.gguf --embedder
+
+# 2. Create a knowledge base and ingest documents (txt/md/code/PDF; incremental)
+aero kb create my-docs --embedder nomic-embed-text-v1.5.Q8_0
+aero kb add my-docs ~/notes ~/papers/paper.pdf
+aero kb sync my-docs          # refresh changed files, prune deleted ones
+aero kb search my-docs "what did we decide about X?"   # debug retrieval
+
+# 3. Point a model at it — retrieval is per-request, so this is a no-reload setting
+printf 'from = "Qwen2.5-3B-Instruct-Q4_K_M"\nknowledge = "my-docs"\n' \
+    > ~/.aero/models/qwen-docs.toml
+```
+
+Now chatting with `qwen-docs` retrieves the top matching chunks for your question,
+injects them into the prompt, and the response carries the **sources** it used
+(shown as citation cards in the UI). The embedder is also exposed directly:
+
+```sh
+curl http://127.0.0.1:8317/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"nomic-embed-text-v1.5.Q8_0","input":["hello","world"]}'
+```
+
+In the **web UI**, the *Knowledge bases* sidebar entry does all of this: create a KB,
+upload + ingest files with a progress bar, re-index, and attach a KB to any model
+from the model editor.
+
+> RAG needs the `rag` extra (`lancedb`, `pypdf`) and a real embedder, so `make
+> install-metal` (or `pip install .[llama,rag]`). The flagged on-disk store keeps KB
+> size bounded by disk, not memory.
 
 ## Tool calling (agents)
 

@@ -97,6 +97,69 @@ export async function pullModel(repo, filename, onEvent, signal) {
   }
 }
 
+// --- knowledge bases (Phase g4) -------------------------------------------
+export const listEmbedders = () => fetch("/api/embedders").then(json);
+export const listKbs = () => fetch("/api/kb").then(json);
+export const getKb = (name) => fetch(`/api/kb/${encodeURIComponent(name)}`).then(json);
+export const createKb = (body) =>
+  fetch("/api/kb", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(json);
+export const deleteKb = (name) =>
+  fetch(`/api/kb/${encodeURIComponent(name)}`, { method: "DELETE" }).then(json);
+export const removeKbFile = (name, source) =>
+  fetch(`/api/kb/${encodeURIComponent(name)}/files/${encodeURIComponent(source)}`, {
+    method: "DELETE",
+  }).then(json);
+
+// Read an SSE response, calling onEvent per parsed frame; resolves on [DONE].
+async function readSSE(res, onEvent) {
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${detail}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data: ")) continue;
+      const data = t.slice(6);
+      if (data === "[DONE]") return;
+      try {
+        onEvent(JSON.parse(data));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+// Upload files to a KB and stream ingest progress (onEvent per SSE frame).
+export async function ingestKb(name, files, onEvent) {
+  const form = new FormData();
+  for (const f of files) form.append("files", f, f.name);
+  const res = await fetch(`/api/kb/${encodeURIComponent(name)}/ingest`, {
+    method: "POST",
+    body: form,
+  });
+  return readSSE(res, onEvent);
+}
+
+// Re-index a KB from its sources (refresh + prune), streaming progress.
+export async function syncKb(name, onEvent) {
+  const res = await fetch(`/api/kb/${encodeURIComponent(name)}/sync`, { method: "POST" });
+  return readSSE(res, onEvent);
+}
+
 // --- streaming chat over /v1/chat/completions -----------------------------
 // Yields parsed OpenAI chunk objects. `signal` lets the caller stop generation.
 export async function* streamChat(body, signal) {
