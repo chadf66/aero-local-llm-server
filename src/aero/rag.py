@@ -201,7 +201,9 @@ def ingest(home: Path, kb: str, paths: list[Path], *, progress_cb: Optional[Inge
             continue
 
         vectors = engine.embed(embedder, [c[2] for c in chunks])
-        shutil.copyfile(fpath, sources_dir / source)
+        dest = sources_dir / source
+        if fpath.resolve() != dest.resolve():  # no-op when re-ingesting from sources/ (sync)
+            shutil.copyfile(fpath, dest)
         rows = [
             {"id": f"{source}:{s}", "vector": v, "text": t, "source": source, "start": s, "end": e}
             for (s, e, t), v in zip(chunks, vectors)
@@ -269,6 +271,28 @@ def delete_kb(home: Path, kb: str) -> None:
     if not kb_exists(home, kb):
         raise ValueError(f"no knowledge base named {kb!r}")
     shutil.rmtree(store.kb_dir(home, kb))
+
+
+def sync(home: Path, kb: str, *, progress_cb: Optional[IngestProgress] = None) -> dict:
+    """Reconcile a KB with its own ``sources/`` directory.
+
+    Prunes files that were deleted from ``sources/`` (dropping their rows + manifest
+    entries), then re-ingests the directory — picking up changed files (sha differs)
+    and any added by hand, while skipping unchanged ones. The difference from
+    ``ingest`` is the pruning half; ``ingest`` only ever adds/updates the paths it's
+    given, never removes.
+    """
+    manifest = _load_manifest(home, kb)
+    sources_dir = store.kb_dir(home, kb) / "sources"
+    present = {p.name for p in sources_dir.iterdir() if p.is_file()} if sources_dir.is_dir() else set()
+    pruned = 0
+    for entry in list(manifest["files"]):
+        if entry["source"] not in present:
+            remove_file(home, kb, entry["source"])
+            pruned += 1
+    result = ingest(home, kb, [sources_dir], progress_cb=progress_cb)
+    result["pruned"] = pruned
+    return result
 
 
 def remove_file(home: Path, kb: str, source: str) -> None:

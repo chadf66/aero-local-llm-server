@@ -10,16 +10,18 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import db, engine, store, store_ops
+from . import db, engine, rag, store, store_ops
 from .schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -438,6 +440,130 @@ def remove_model(name: str, weights: bool = False) -> dict:
         raise HTTPException(status_code=404, detail=str(exc))
     result["models"] = engine.reload_from_disk()
     return result
+
+
+# =========================================================================== #
+# Knowledge bases (Phase g4). CRUD + ingest/sync with SSE progress, reusing rag.py
+# (the same code path as the `aero kb` CLI).
+# =========================================================================== #
+
+
+class KbCreate(BaseModel):
+    name: str
+    embedder: str
+    chunk_size: int = 1200
+    overlap: int = 150
+
+
+def _kb_progress_stream(run) -> StreamingResponse:
+    """Run a long KB op (ingest/sync) in a thread, streaming its progress as SSE.
+
+    ``run(progress_cb)`` performs the work and returns a summary dict."""
+    def event_stream():
+        events: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                summary = run(lambda i, t, s, st: events.put(("progress", (i, t, s, st))))
+                events.put(("done", summary))
+            except Exception as exc:  # noqa: BLE001 - report, don't crash the server
+                logger.exception("kb operation failed")
+                events.put(("error", str(exc)))
+            finally:
+                events.put(("__end__", None))
+
+        threading.Thread(target=worker, name="aero-kb", daemon=True).start()
+        while True:
+            kind, payload = events.get()
+            if kind == "__end__":
+                break
+            if kind == "progress":
+                i, t, s, st = payload
+                yield _sse({"type": "progress", "i": i, "total": t, "source": s, "status": st})
+            elif kind == "done":
+                yield _sse({"type": "done", **payload})
+            elif kind == "error":
+                yield _sse({"type": "error", "detail": payload})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/kb")
+def list_kbs() -> dict:
+    _require_home()
+    return {"kbs": rag.list_kbs(engine.home())}
+
+
+@app.get("/api/kb/{name}")
+def get_kb(name: str) -> dict:
+    _require_home()
+    kb = rag.get_kb(engine.home(), name)
+    if kb is None:
+        raise HTTPException(status_code=404, detail=f"no knowledge base named {name!r}")
+    return kb
+
+
+@app.post("/api/kb")
+def create_kb(body: KbCreate) -> dict:
+    home = _require_home()
+    try:
+        return rag.create_kb(home, body.name, body.embedder,
+                             chunk_size=body.chunk_size, overlap=body.overlap)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/kb/{name}")
+def delete_kb(name: str) -> dict:
+    home = _require_home()
+    try:
+        rag.delete_kb(home, name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"deleted": name}
+
+
+@app.delete("/api/kb/{name}/files/{source}")
+def remove_kb_file(name: str, source: str) -> dict:
+    home = _require_home()
+    try:
+        rag.remove_file(home, name, source)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return rag.get_kb(home, name)
+
+
+@app.post("/api/kb/{name}/ingest")
+async def ingest_kb(name: str, files: list[UploadFile] = File(...)):
+    """Upload files and ingest them into a KB, streaming progress as SSE."""
+    home = _require_home()
+    if not rag.kb_exists(home, name):
+        raise HTTPException(status_code=404, detail=f"no knowledge base named {name!r}")
+    # Read uploads in the async context, stage to a temp dir, then ingest in a thread.
+    tmp = Path(tempfile.mkdtemp(prefix="aero-ingest-"))
+    saved = []
+    for f in files:
+        dest = tmp / Path(f.filename).name
+        dest.write_bytes(await f.read())
+        saved.append(dest)
+
+    def run(cb):
+        try:
+            return rag.ingest(home, name, saved, progress_cb=cb)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    return _kb_progress_stream(run)
+
+
+@app.post("/api/kb/{name}/sync")
+def sync_kb(name: str):
+    """Re-index a KB from its sources/ (refresh changed, prune deleted), SSE progress."""
+    home = _require_home()
+    if not rag.kb_exists(home, name):
+        raise HTTPException(status_code=404, detail=f"no knowledge base named {name!r}")
+    return _kb_progress_stream(lambda cb: rag.sync(home, name, progress_cb=cb))
 
 
 # --------------------------------------------------------------------------- #

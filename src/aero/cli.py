@@ -309,6 +309,25 @@ def kb_add(
                f"{result['skipped']} skipped. KB now holds {result['total_files']} file(s).")
 
 
+@kb_app.command("sync")
+def kb_sync(
+    name: str = typer.Argument(..., help="Knowledge base name."),
+    home: Path = _home_opt,
+) -> None:
+    """Re-index a KB from its own sources/: refresh changed files and prune deleted ones."""
+    from . import rag
+    if not rag.kb_exists(home, name):
+        raise typer.BadParameter(f"no knowledge base named {name!r}")
+    _engine_for_embedding(home)
+
+    def progress(i: int, total: int, source: str, status: str) -> None:
+        typer.echo(f"  [{i}/{total}] {status:<8} {source}")
+
+    result = rag.sync(home, name, progress_cb=progress)
+    typer.echo(f"Synced: {result['files_ingested']} refreshed, {result['pruned']} pruned, "
+               f"{result['skipped']} unchanged. KB holds {result['total_files']} file(s).")
+
+
 @kb_app.command("list")
 def kb_list(home: Path = _home_opt) -> None:
     """List knowledge bases."""

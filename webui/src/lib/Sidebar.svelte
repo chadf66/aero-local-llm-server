@@ -41,6 +41,7 @@
   </div>
 
   <button class="manage" on:click={() => dispatch("manage")}>⚙ Manage models</button>
+  <button class="manage" on:click={() => dispatch("knowledge")}>📚 Knowledge bases</button>
 </aside>
 
 <style>
