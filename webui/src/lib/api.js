@@ -67,8 +67,9 @@ export const deleteModel = (name, weights = false) =>
 
 // Stream a pull's SSE progress. `onEvent` gets each parsed frame
 // ({type:"progress"|"done"|"error", ...}); resolves when the stream ends.
-export async function pullModel(repo, filename, onEvent, signal) {
-  const url = `/api/models/pull?repo=${encodeURIComponent(repo)}&filename=${encodeURIComponent(filename)}`;
+export async function pullModel(repo, filename, onEvent, signal, embedder = false) {
+  const url = `/api/models/pull?repo=${encodeURIComponent(repo)}&filename=${encodeURIComponent(filename)}`
+    + (embedder ? "&embedder=true" : "");
   const res = await fetch(url, { signal });
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText);

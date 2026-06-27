@@ -328,8 +328,12 @@ def list_repo_models(repo: str) -> dict:
 
 
 @app.get("/api/models/pull")
-def pull_model(repo: str, filename: str):
-    """Stream a GGUF download as SSE progress, then register it and reload (no restart)."""
+def pull_model(repo: str, filename: str, embedder: bool = False):
+    """Stream a GGUF download as SSE progress, then register it and reload (no restart).
+
+    With ``embedder=true`` the GGUF lands in ``embedders/`` and no chat config is
+    written — it becomes available to ``/v1/embeddings`` and RAG, never offered for chat.
+    """
     home = _require_home()
     if not _pull_active.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="a download is already in progress")
@@ -339,13 +343,17 @@ def pull_model(repo: str, filename: str):
 
         def worker():
             try:
+                dest = store.embedders_dir(home) if embedder else store.gguf_dir(home)
                 store_ops.download_gguf(
-                    repo, filename, store.gguf_dir(home),
+                    repo, filename, dest,
                     progress_cb=lambda d, t: events.put(("progress", (d, t))),
                 )
                 stem = Path(filename).stem
-                store_ops.write_starter_config(home, stem)
-                engine.reload_from_disk()
+                if not embedder:
+                    # Embedders are scanned from disk live; only chat models need a
+                    # starter config + registry reload.
+                    store_ops.write_starter_config(home, stem)
+                    engine.reload_from_disk()
                 events.put(("done", {"name": stem}))
             except Exception as exc:  # noqa: BLE001 - report to the client, don't crash
                 events.put(("error", str(exc)))

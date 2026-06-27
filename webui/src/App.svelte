@@ -267,7 +267,8 @@
         {/if}
 
         {#each current.messages.filter((m) => m.role !== "tool") as m (m)}
-          <Message message={m} {toolResults} />
+          <Message message={m} {toolResults}
+                   thinking={generating && m === current.messages[current.messages.length - 1]} />
         {/each}
         {#if error}<div class="error small">{error}</div>{/if}
       </div>
