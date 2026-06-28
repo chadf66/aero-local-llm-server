@@ -46,7 +46,7 @@ _GGML_TYPE = {"f16": 1, "q8_0": 8, "q4_0": 2}
 _models: dict[str, ModelConfig] = {}   # model name -> its per-model config
 _backend = "llama"
 _idle_timeout = 300.0                  # seconds; 0 disables idle-unload
-_mem_fraction = 0.70                   # fraction of total memory for `n_ctx = "auto"`
+_mem_fraction = 0.60                   # fraction of total memory for `n_ctx = "auto"`
 
 # Registry-build context, remembered so the engine can rebuild the model set from
 # disk after the admin API pulls/edits/deletes a model (reload_from_disk). None when
@@ -83,7 +83,7 @@ def configure(
     *,
     backend: str = "llama",
     idle_timeout: float = 300.0,
-    mem_fraction: float = 0.70,
+    mem_fraction: float = 0.60,
     home=None,
     registry_defaults: Optional[dict] = None,
 ) -> None:
@@ -207,7 +207,10 @@ def context_preview(name: str, kv_cache_type: str) -> Optional[int]:
 
         dims = sizing.read_gguf_dims(cfg.path)
         budget = int(sizing.total_memory_bytes() * _mem_fraction)
-        n_ctx = sizing.compute_fit(dims, os.path.getsize(cfg.path), kv_cache_type, budget)
+        n_ctx = sizing.compute_fit(
+            dims, os.path.getsize(cfg.path), kv_cache_type, budget,
+            reserve_bytes=_embedder_reserve_bytes(cfg),
+        )
         return n_ctx or None
     except Exception:  # noqa: BLE001 - preview is best-effort; never fail the request
         logger.debug("context_preview failed for %s", name, exc_info=True)
@@ -284,6 +287,30 @@ def _parse_tool_calls(text: Optional[str], tool_names: Optional[set] = None) -> 
 # --------------------------------------------------------------------------- #
 
 
+def _embedder_reserve_bytes(cfg: ModelConfig) -> int:
+    """Memory to hold back in auto-sizing for a co-resident embedder.
+
+    When a model has a knowledge base, its embedder is loaded *alongside* the chat
+    model for retrieval (the second resident slot). Auto-sizing must leave room for it,
+    or the chat model gets a context it can load but can't decode once the embedder is
+    also resident -- which surfaces as ``llama_decode returned -3``. Estimated from the
+    embedder's GGUF size plus runtime overhead (MoE experts, KV, scratch)."""
+    if not cfg.knowledge or _home is None:
+        return 0
+    try:
+        from . import rag, store
+
+        kb = rag.get_kb(_home, cfg.knowledge)
+        if not kb:
+            return 0
+        path = store.embedders_dir(_home) / f"{kb['embedder']}.gguf"
+        if path.is_file():
+            return int(path.stat().st_size * 1.4)
+    except Exception:  # noqa: BLE001 - best-effort; reserve nothing if we can't size it
+        logger.warning("could not size embedder reserve for kb=%s", cfg.knowledge, exc_info=True)
+    return 0
+
+
 def _load(name: str) -> None:
     global _handle, _loaded_name, _loaded_key, _load_calls
     cfg = _models[name]
@@ -296,7 +323,10 @@ def _load(name: str) -> None:
 
         if n_ctx == "auto":
             from . import sizing
-            n_ctx = sizing.auto_n_ctx(cfg.path, cfg.kv_cache_type, _mem_fraction)
+            n_ctx = sizing.auto_n_ctx(
+                cfg.path, cfg.kv_cache_type, _mem_fraction,
+                reserve_bytes=_embedder_reserve_bytes(cfg),
+            )
 
         # n_gpu_layers=-1 puts every layer on the Metal GPU -- the whole point on
         # Apple Silicon. Quantized KV cache needs flash attention enabled.
@@ -573,7 +603,21 @@ def _tool_system_prompt(request: ChatCompletionRequest) -> str:
 
 # Safety cap on injected RAG context, so retrieval can't blow the (small) context
 # budget regardless of chunk size x top_k.
+# Absolute ceiling on injected context, regardless of how big the window is -- we
+# never want to dump an unbounded wall of text at the model. The *real* limit is
+# computed per-request against the live n_ctx (see _context_token_budget).
 _MAX_CONTEXT_CHARS = 12000
+# Conservative chars-per-token used to convert a token budget into a char budget.
+# Deliberately low (code/markup tokenize to fewer chars/token than prose) so we
+# under-fill rather than overflow; the safety margin absorbs the rest.
+_CHARS_PER_TOKEN = 3.2
+# Tokens held back for the model's answer when the request/config set no max_tokens.
+_DEFAULT_COMPLETION_RESERVE = 512
+# Slack for chat-template tokens and tokenizer estimation error.
+_CONTEXT_SAFETY_MARGIN = 256
+# Below this, there isn't enough room for context to be worth injecting -- answer
+# ungrounded instead of crowding out the conversation (or overflowing the window).
+_MIN_CONTEXT_TOKENS = 64
 
 
 def _retrieve(request: ChatCompletionRequest, cfg: ModelConfig) -> list[dict]:
@@ -596,17 +640,22 @@ def _retrieve(request: ChatCompletionRequest, cfg: ModelConfig) -> list[dict]:
         return []
 
 
-def _format_context(sources: list[dict]) -> str:
-    """Render retrieved chunks into a system-prompt context block with [n] tags."""
+def _format_context(sources: list[dict], max_chars: int) -> str:
+    """Render retrieved chunks into a system-prompt context block with [n] tags.
+
+    Caps total chunk text at ``max_chars``, keeping highest-ranked chunks first and
+    truncating/dropping the rest -- so the block always fits the caller's budget."""
     blocks, used = [], 0
     for i, s in enumerate(sources, start=1):
+        if used >= max_chars:
+            break
         text = s["text"]
-        if used + len(text) > _MAX_CONTEXT_CHARS:
-            text = text[: max(0, _MAX_CONTEXT_CHARS - used)]
+        if used + len(text) > max_chars:
+            text = text[: max(0, max_chars - used)]
+        if not text:
+            break
         blocks.append(f"[{i}] (source: {s['source']})\n{text}")
         used += len(text)
-        if used >= _MAX_CONTEXT_CHARS:
-            break
     body = "\n\n".join(blocks)
     return (
         "You have access to the following context from a knowledge base. Use it to "
@@ -614,6 +663,50 @@ def _format_context(sources: list[dict]) -> str:
         "know rather than guessing. Cite sources inline using their [n] tags.\n\n"
         f"<context>\n{body}\n</context>"
     )
+
+
+def _estimate_prompt_tokens(handle: Any, request: ChatCompletionRequest, cfg: ModelConfig) -> int:
+    """Rough token count for the conversation (system + messages), *excluding* RAG
+    context. Uses the model's own tokenizer when available, plus a small per-message
+    overhead for chat-template/role markers."""
+    texts: list[str] = []
+    if cfg.system and not any(m.role == "system" for m in request.messages):
+        texts.append(cfg.system)
+    texts.extend(m.content for m in request.messages if m.content)
+    blob = "\n".join(texts)
+    try:
+        n = len(handle.tokenize(blob.encode("utf-8"), add_bos=True, special=True))
+    except Exception:  # noqa: BLE001 - fall back to a char heuristic
+        n = int(len(blob) / _CHARS_PER_TOKEN)
+    overhead = 4 * (len(request.messages) + (1 if cfg.system else 0))
+    return n + overhead
+
+
+def _build_context(
+    handle: Any, request: ChatCompletionRequest, cfg: ModelConfig, sources: list[dict]
+) -> Optional[str]:
+    """Format retrieved chunks into a context block sized to fit the live window.
+
+    Budgets against ``handle.n_ctx()``, reserving room for the conversation and the
+    answer, so the injected context can't push the prompt past the model's context
+    window (which surfaces as ``llama_decode returned -3``). Returns None when there's
+    too little room -- the model then answers ungrounded rather than crashing."""
+    if _backend != "llama":  # stub: no real window/tokenizer, keep the old behavior
+        return _format_context(sources, _MAX_CONTEXT_CHARS)
+
+    n_ctx = handle.n_ctx()
+    eff_max = request.max_tokens if "max_tokens" in request.model_fields_set else cfg.max_tokens
+    completion_reserve = min(eff_max or _DEFAULT_COMPLETION_RESERVE, n_ctx // 2)
+    convo_tokens = _estimate_prompt_tokens(handle, request, cfg)
+    budget_tokens = n_ctx - completion_reserve - convo_tokens - _CONTEXT_SAFETY_MARGIN
+    if budget_tokens < _MIN_CONTEXT_TOKENS:
+        logger.warning(
+            "no room for RAG context (n_ctx=%s, convo≈%s tokens); answering ungrounded",
+            n_ctx, convo_tokens,
+        )
+        return None
+    max_chars = min(_MAX_CONTEXT_CHARS, int(budget_tokens * _CHARS_PER_TOKEN))
+    return _format_context(sources, max_chars)
 
 
 def _effective_kwargs(
@@ -710,7 +803,7 @@ def run_inference(request: ChatCompletionRequest) -> tuple[dict, str, Usage, lis
             return ({"role": "assistant", "content": text}, "stop",
                     _usage(_stub_prompt_tokens(request), len(text.split())), sources)
 
-        context = _format_context(sources) if sources else None
+        context = _build_context(handle, request, cfg, sources) if sources else None
         result = handle.create_chat_completion(**_effective_kwargs(request, cfg, context))
         choice, u = result["choices"][0], result["usage"]
         message = choice["message"]
@@ -746,7 +839,7 @@ def stream_inference(
         sources = _retrieve(request, cfg)
         if sources:
             yield "sources", sources
-        context = _format_context(sources) if sources else None
+        context = _build_context(handle, request, cfg, sources) if sources else None
 
         if _backend == "stub":
             if request.tools:

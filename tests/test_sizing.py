@@ -38,6 +38,16 @@ def test_compute_fit_quantized_kv_fits_more():
     assert q4 >= 3 * f16  # quartering the bytes/token roughly quadruples the fit
 
 
+def test_compute_fit_reserve_shrinks_context():
+    # Reserving memory for a co-resident embedder leaves less room for the KV cache,
+    # so the fitted context must shrink (the RAG-model fix).
+    d = GGUFDims(n_layers=32, n_kv_heads=8, head_dim=128, n_ctx_train=131072)
+    budget = sizing._OVERHEAD_BYTES + 4 * 1024**3
+    base = compute_fit(d, 0, "f16", budget)
+    with_embedder = compute_fit(d, 0, "f16", budget, reserve_bytes=2 * 1024**3)
+    assert with_embedder < base
+
+
 def test_compute_fit_zero_when_weights_exceed_budget():
     d = GGUFDims(n_layers=32, n_kv_heads=8, head_dim=128, n_ctx_train=131072)
     assert compute_fit(d, weights_bytes=10**12, kv_cache_type="f16", budget_bytes=1) == 0
