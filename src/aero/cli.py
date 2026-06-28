@@ -61,7 +61,9 @@ def serve(
         "f16", "--kv-cache-type", help="Default KV-cache precision: f16 | q8_0 | q4_0."
     ),
     mem_fraction: float = typer.Option(
-        0.70, "--mem-fraction", help="Fraction of total memory to budget when n_ctx is 'auto'."
+        0.60, "--mem-fraction",
+        help="Fraction of total memory to budget when n_ctx is 'auto'. Conservative by "
+             "default so a model + co-resident embedder (RAG) fit; raise it if you have headroom.",
     ),
     idle_timeout: int = typer.Option(
         300, "--idle-timeout", help="Free the resident model after N idle seconds (0 = never)."

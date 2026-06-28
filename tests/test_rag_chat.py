@@ -105,6 +105,53 @@ def test_missing_kb_degrades_gracefully(home):
     assert sources == []  # no crash, just ungrounded
 
 
+class _FakeHandle:
+    """A llama-like handle exposing just n_ctx()/tokenize() for budget tests.
+    Tokenizes ~1 token per 4 bytes so token math is predictable."""
+    def __init__(self, n_ctx):
+        self._n = n_ctx
+
+    def n_ctx(self):
+        return self._n
+
+    def tokenize(self, b, add_bos=True, special=True):
+        return [0] * (len(b) // 4 + 1)
+
+
+def test_context_budget_trims_to_window(monkeypatch):
+    # A big pile of retrieved text against a roomy window: trimmed to the char budget,
+    # never the full payload, and bounded by the absolute ceiling.
+    monkeypatch.setattr(engine, "_backend", "llama")
+    sources = [{"source": "f", "text": "x" * 5000} for _ in range(10)]
+    cfg = ModelConfig(name="g", path=FAKE, knowledge="docs")
+    req = _req("g", "short question")
+    block = engine._build_context(_FakeHandle(8192), req, cfg, sources)
+    assert block is not None
+    payload = block.split("<context>")[1]
+    assert len(payload) <= engine._MAX_CONTEXT_CHARS + 200  # ceiling (+ wrapper text)
+
+
+def test_context_budget_skips_when_no_room(monkeypatch):
+    # Tiny window: there's no room for context, so we answer ungrounded (None) rather
+    # than overflow the prompt -> the llama_decode -3 this fix targets.
+    monkeypatch.setattr(engine, "_backend", "llama")
+    sources = [{"source": "f", "text": "x" * 5000}]
+    cfg = ModelConfig(name="g", path=FAKE, knowledge="docs")
+    req = _req("g", "q")
+    assert engine._build_context(_FakeHandle(256), req, cfg, sources) is None
+
+
+def test_context_budget_shrinks_with_window(monkeypatch):
+    # A smaller window must inject strictly less context than a larger one.
+    monkeypatch.setattr(engine, "_backend", "llama")
+    sources = [{"source": "f", "text": "x" * 20000}]
+    cfg = ModelConfig(name="g", path=FAKE, knowledge="docs")
+    req = _req("g", "q")
+    big = engine._build_context(_FakeHandle(8192), req, cfg, sources)
+    small = engine._build_context(_FakeHandle(1024), req, cfg, sources)
+    assert len(small) < len(big)
+
+
 def test_admin_sets_knowledge_on_model(home, client):
     # Needs a real GGUF for write_model_config's weights check; create one.
     from aero import store
