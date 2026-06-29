@@ -758,7 +758,55 @@ def _effective_kwargs(
         "max_tokens": pick("max_tokens", cfg.max_tokens),
         "stop": pick("stop", cfg.sampling.stop),
         "seed": request.seed,
+        "response_format": _response_format_kwarg(request),
     }
+
+
+def _response_format_kwarg(request: ChatCompletionRequest) -> Optional[dict]:
+    """Translate the OpenAI ``response_format`` into llama.cpp's shape, which is
+    ``{"type": "json_object", "schema": <jsonschema>}`` (it builds the GBNF grammar
+    internally). Returns None for plain text -- and when ``tools`` is set, since tool
+    calling is already a constrained-grammar mode and the two would conflict."""
+    rf = request.response_format
+    if rf is None or rf.type == "text" or request.tools:
+        return None
+    if rf.type == "json_object":
+        return {"type": "json_object"}
+    # json_schema: hand the schema to llama.cpp's json_object+schema path.
+    return {"type": "json_object", "schema": rf.json_schema.schema_}
+
+
+def _stub_json_for_schema(schema: dict) -> Any:
+    """A minimal value that satisfies ``schema`` -- so the stub backend can return
+    schema-conformant JSON (the stub can't constrain decoding, but this lets the whole
+    response_format path be tested with no model)."""
+    if schema.get("enum"):
+        return schema["enum"][0]
+    t = schema.get("type")
+    if t == "object":
+        props = schema.get("properties", {})
+        required = schema.get("required", list(props.keys()))
+        return {k: _stub_json_for_schema(props.get(k, {})) for k in required}
+    if t == "array":
+        return []
+    if t in ("number", "integer"):
+        return 0
+    if t == "boolean":
+        return False
+    if t == "string":
+        return "stub"
+    return None
+
+
+def _stub_content(request: ChatCompletionRequest) -> str:
+    """The stub backend's response content, honoring ``response_format`` so JSON modes
+    return valid JSON instead of the echo text."""
+    rf = request.response_format
+    if rf and not request.tools and rf.type in ("json_object", "json_schema"):
+        value = _stub_json_for_schema(rf.json_schema.schema_) if rf.type == "json_schema" else {}
+        return json.dumps(value)
+    last = request.messages[-1].content if request.messages else ""
+    return f"[stub:{request.model}] echo: {last}"
 
 
 def _usage(prompt_tokens: int, completion_tokens: int) -> Usage:
@@ -798,8 +846,7 @@ def run_inference(request: ChatCompletionRequest) -> tuple[dict, str, Usage, lis
             if request.tools:
                 msg = {"role": "assistant", "content": None, "tool_calls": [_stub_tool_call(request)]}
                 return msg, "tool_calls", _usage(_stub_prompt_tokens(request), 1), sources
-            last = request.messages[-1].content if request.messages else ""
-            text = f"[stub:{request.model}] echo: {last}"
+            text = _stub_content(request)
             return ({"role": "assistant", "content": text}, "stop",
                     _usage(_stub_prompt_tokens(request), len(text.split())), sources)
 
@@ -845,6 +892,11 @@ def stream_inference(
             if request.tools:
                 yield "delta", {"role": "assistant", "tool_calls": [{"index": 0, **_stub_tool_call(request)}]}
                 finish_reason = "tool_calls"
+            elif request.response_format and request.response_format.type != "text":
+                # JSON modes: emit the whole valid-JSON payload as one delta.
+                text = _stub_content(request)
+                pieces.append(text)
+                yield "delta", {"content": text}
             else:
                 last = request.messages[-1].content if request.messages else ""
                 for word in f"[stub:{request.model}] echo: {last}".split(" "):
