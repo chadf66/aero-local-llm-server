@@ -293,10 +293,52 @@ A model fine-tuned for it (e.g. **Hermes-2-Pro**) calls reliably in `auto` mode;
 general small model is hit-or-miss. `tool_choice` (a specific function or
 `"required"`) forces a call regardless.
 
+## Structured output
+
+aero speaks the OpenAI `response_format` API, so you can constrain generation to valid
+JSON — or to an exact JSON Schema. The model is decoded against a grammar, so invalid
+output is *impossible by construction* (not just discouraged in the prompt). This is the
+most reliable way to use a small local model: it can't emit malformed JSON or an
+out-of-enum label, leaving it only the narrow job it does well.
+
+Three modes:
+
+- `{"type": "text"}` — default, unconstrained.
+- `{"type": "json_object"}` — any syntactically valid JSON.
+- `{"type": "json_schema", "json_schema": {"schema": { ... }}}` — output must conform to
+  the given JSON Schema (types, `required`, `enum`, nesting, arrays).
+
+```python
+client.chat.completions.create(
+    model="qwen", messages=[{"role": "user", "content": "Is this spam? 'You won! Click here'"}],
+    response_format={"type": "json_schema", "json_schema": {"schema": {
+        "type": "object",
+        "properties": {
+            "reasoning": {"type": "string"},
+            "label": {"type": "string", "enum": ["spam", "not_spam"]},
+        },
+        "required": ["reasoning", "label"],
+    }}},
+)
+# -> message.content is a JSON string: {"reasoning": "...", "label": "spam"}
+```
+
+> **Put a `reasoning` field *before* the answer field.** Generation is top-to-bottom, so
+> the model writes its reasoning first and the answer is conditioned on it — chain-of-thought
+> that still ends in a clean, parseable object. Reverse the order and the reasoning is just a
+> useless after-the-fact rationalization. You can ignore the field after parsing; it did its
+> job by conditioning the answer.
+
+Notes: `response_format` is ignored when `tools` is set (tool calling is its own
+constrained mode). llama.cpp's converter covers the common JSON-Schema core; very advanced
+keywords (recursive `$ref`, conditionals) aren't guaranteed. The output is *valid*, not
+*correct* — the grammar guarantees shape, not truth.
+
 ## API
 
 - `POST /v1/chat/completions` — streaming SSE + non-streaming chat completions,
-  including `tools` / `tool_choice` and `tool_calls` for tool-enabled models.
+  including `tools` / `tool_choice` and `tool_calls` for tool-enabled models, and
+  `response_format` for constrained JSON / JSON-Schema output.
 - `GET /v1/models` — lists every available model.
 - `GET /healthz` — liveness, available models, and the one currently resident.
 

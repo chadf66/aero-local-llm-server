@@ -15,7 +15,7 @@ import time
 import uuid
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # --------------------------------------------------------------------------- #
 # Tool-calling types (OpenAI "function" tools)
@@ -53,6 +53,31 @@ class ToolCall(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
+class JsonSchemaSpec(BaseModel):
+    """The ``json_schema`` payload of a ``response_format`` (OpenAI Structured Outputs)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: Optional[str] = None
+    # 'schema' collides with BaseModel.schema(); accept the wire key via alias.
+    schema_: dict[str, Any] = Field(alias="schema")
+    strict: Optional[bool] = None  # accepted; grammar decoding is always strict
+
+
+class ResponseFormat(BaseModel):
+    """Constrains generation. ``text`` (default), ``json_object`` (any valid JSON),
+    or ``json_schema`` (output must conform to the given JSON Schema)."""
+
+    type: Literal["text", "json_object", "json_schema"] = "text"
+    json_schema: Optional[JsonSchemaSpec] = None
+
+    @model_validator(mode="after")
+    def _require_schema(self) -> "ResponseFormat":
+        if self.type == "json_schema" and self.json_schema is None:
+            raise ValueError("response_format.type 'json_schema' requires a 'json_schema'")
+        return self
+
+
 class ChatMessage(BaseModel):
     """A single turn in the conversation.
 
@@ -87,6 +112,9 @@ class ChatCompletionRequest(BaseModel):
     # Tool calling. ``tool_choice`` is "auto" | "none" | {"type":"function",...}.
     tools: Optional[list[Tool]] = None
     tool_choice: Optional[Union[str, dict]] = None
+    # Constrained/structured output (OpenAI-compatible). Ignored when ``tools`` is set
+    # (tool calling is its own constrained mode).
+    response_format: Optional[ResponseFormat] = None
 
 
 # --------------------------------------------------------------------------- #
